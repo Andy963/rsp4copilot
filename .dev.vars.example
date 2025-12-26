@@ -29,11 +29,13 @@
 # CLAUDE_MAX_TOKENS=8192
 
 # Debug logging
-# RSP4COPILOT_DEBUG=1
+# RSP4COPILOT_DEBUG=true
 
 # For local dev only you can put secrets here (Cloudflare recommends using `wrangler secret put` for production):
 # OPENAI_API_KEY=sk-...
 # WORKER_AUTH_KEY=your-worker-auth-key
+# Optional: multiple client auth keys (comma-separated)
+# WORKER_AUTH_KEYS=key1,key2,key3
 
 # Model listing for /v1/models
 DEFAULT_MODEL=gpt-5.2

@@ -59,6 +59,8 @@ python -c "import secrets; print(secrets.token_hex(32))"
 ```bash
 npx wrangler login
 npx wrangler secret put WORKER_AUTH_KEY      # 粘贴上一步生成的密钥
+# 可选：多 Key（逗号分隔），用于多人/多客户端或 Key 轮换
+# npx wrangler secret put WORKER_AUTH_KEYS
 npx wrangler secret put OPENAI_API_KEY       # OpenAI API Key
 npx wrangler secret put GEMINI_API_KEY       # Gemini API Key（可选）
 npx wrangler secret put CLAUDE_API_KEY       # Claude API Key（可选）
@@ -223,7 +225,7 @@ CLAUDE_BASE_URL = "https://your-relay-server.example/api"
 CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 CLAUDE_MESSAGES_PATH = "/messages" # 可选：覆盖推断出的 Messages API 路径（或用 "/v1/messages"）
 CLAUDE_MAX_TOKENS = 8192 # 可选：限制 Claude 输出 token 上限（设为 0 表示不限制）
-RSP4COPILOT_DEBUG = "1" # 可选：强制打印调试日志（设为 "0" 关闭）
+RSP4COPILOT_DEBUG = "true" # 可选：开启详细调试日志（"false"/"0" 关闭）
 ```
 
 特性：
@@ -236,6 +238,7 @@ RSP4COPILOT_DEBUG = "1" # 可选：强制打印调试日志（设为 "0" 关闭�
 ```bash
 cp .dev.vars.example .dev.vars
 # 编辑 .dev.vars，填入你的密钥
+# 可选：设置 RSP4COPILOT_DEBUG=true 开启详细日志
 
 npm run dev
 ```
@@ -269,12 +272,16 @@ curl -sS -H "Authorization: Bearer <WORKER_AUTH_KEY>" \
 ## 调试
 
 ```bash
-# 终端 1：查看日志
+# 1) 开启调试日志：在 wrangler.toml 的 [vars] 里设置
+# RSP4COPILOT_DEBUG = "true"
+# 然后重新部署
+npm run deploy
+
+# 2) 终端 1：查看日志（需要 Cloudflare 登录态）
 npx wrangler tail rsp4copilot
 
-# 终端 2：发送带 debug header 的请求
+# 3) 终端 2：发送请求（无需额外 header）
 curl -sS -H "Authorization: Bearer <WORKER_AUTH_KEY>" \
-  -H "x-rsp4copilot-debug: 1" \
   -H "Content-Type: application/json" \
   https://<your-worker>.workers.dev/v1/chat/completions \
   -d '{"model":"gpt-5.2","messages":[{"role":"user","content":"hello"}]}'

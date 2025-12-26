@@ -1,5 +1,5 @@
 /**
- * rsp2com on Cloudflare Workers
+ * rsp4copilot on Cloudflare Workers
  * - Inbound: OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/models`
  * - Upstream: OpenAI Responses API (`/v1/responses`), streamed SSE
  * - Multi-turn: remembers `previous_response_id` in cache (best-effort)
@@ -14,8 +14,10 @@
  * - GEMINI_API_KEY (optional, Gemini upstream API key)
  * - GEMINI_DEFAULT_MODEL (optional, default: "gemini-3-pro-preview")
  * - WORKER_AUTH_KEY (client auth key for this Worker)
+ * - WORKER_AUTH_KEYS (optional, comma-separated; allows multiple client auth keys)
  * - DEFAULT_MODEL (optional)
  * - MODELS or ADAPTER_MODELS (optional, comma-separated)
+ * - RSP4COPILOT_DEBUG (optional, "true"/"1" enables verbose debug logs)
  */
 
 function jsonResponse(status, obj) {
@@ -30,6 +32,100 @@ function jsonResponse(status, obj) {
 
 function jsonError(message, code = "bad_request") {
   return { error: { message, type: "invalid_request_error", code } };
+}
+
+function parseBoolEnv(value) {
+  const v = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!v) return false;
+  return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on";
+}
+
+function isDebugEnabled(env) {
+  return parseBoolEnv(typeof env?.RSP4COPILOT_DEBUG === "string" ? env.RSP4COPILOT_DEBUG : "");
+}
+
+function maskSecret(value) {
+  const v = typeof value === "string" ? value : value == null ? "" : String(value);
+  if (!v) return "";
+  const s = v.trim();
+  if (!s) return "";
+  if (s.length <= 8) return `${"*".repeat(s.length)} (len=${s.length})`;
+  return `${s.slice(0, 4)}…${s.slice(-4)} (len=${s.length})`;
+}
+
+function previewString(value, maxLen = 1200) {
+  const v = typeof value === "string" ? value : value == null ? "" : String(value);
+  if (!v) return "";
+  if (v.length <= maxLen) return v;
+  return `${v.slice(0, maxLen)}…(truncated,len=${v.length})`;
+}
+
+function redactHeadersForLog(headers) {
+  const out = {};
+  const h = headers && typeof headers === "object" ? headers : {};
+  for (const [k, v] of Object.entries(h)) {
+    const key = String(k || "");
+    const lower = key.toLowerCase();
+    if (lower === "authorization" || lower.includes("api-key") || lower.includes("token") || lower.includes("secret")) {
+      out[key] = maskSecret(v);
+      continue;
+    }
+    out[key] = typeof v === "string" ? previewString(v, 200) : v;
+  }
+  return out;
+}
+
+function safeJsonStringifyForLog(value, maxStringLen = 800) {
+  const seen = new WeakSet();
+  const isSensitiveKey = (keyLower) =>
+    keyLower === "authorization" ||
+    keyLower.includes("api_key") ||
+    keyLower.endsWith("api-key") ||
+    keyLower.endsWith("_key") ||
+    keyLower.endsWith("key") ||
+    keyLower.includes("token") ||
+    keyLower.includes("password") ||
+    keyLower.includes("passwd") ||
+    keyLower.includes("secret");
+
+  return JSON.stringify(value, (key, v) => {
+    if (v && typeof v === "object") {
+      if (seen.has(v)) return "[Circular]";
+      seen.add(v);
+      return v;
+    }
+    if (typeof v === "string") {
+      const keyLower = String(key || "").toLowerCase();
+      if (isSensitiveKey(keyLower)) return maskSecret(v);
+      return previewString(v, maxStringLen);
+    }
+    return v;
+  });
+}
+
+function logDebug(enabled, reqId, label, data) {
+  if (!enabled) return;
+  const prefix = reqId ? `[rsp4copilot][${reqId}]` : "[rsp4copilot]";
+  if (data === undefined) {
+    console.log(`${prefix} ${label}`);
+  } else {
+    console.log(`${prefix} ${label}`, data);
+  }
+}
+
+function getWorkerAuthKeys(env) {
+  const keys = new Set();
+
+  const single = normalizeAuthValue(env?.WORKER_AUTH_KEY);
+  if (single) keys.add(single);
+
+  const multiRaw = typeof env?.WORKER_AUTH_KEYS === "string" ? env.WORKER_AUTH_KEYS : "";
+  for (const part of String(multiRaw || "").split(",")) {
+    const k = normalizeAuthValue(part);
+    if (k) keys.add(k);
+  }
+
+  return Array.from(keys);
 }
 
 function bearerToken(headerValue) {
@@ -1676,7 +1772,7 @@ function extractFromResponsesSseText(sseText) {
   return { text, responseId, model, createdAt, toolCalls };
 }
 
-async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = false) {
+async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = false, reqId = "") {
   let lastStatus = 502;
   let lastText = "";
   let firstErr = null; // { status, text }
@@ -1684,21 +1780,32 @@ async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = fa
   for (let i = 0; i < variants.length; i++) {
     const body = JSON.stringify(variants[i]);
     if (debug) {
-      console.log("rsp2com debug fetch", {
+      logDebug(debug, reqId, "openai upstream fetch", {
         url: upstreamUrl,
         variant: i,
+        headers: redactHeadersForLog(headers),
         bodyLen: body.length,
-        bodyPreview: body.slice(0, 300),
-        authLen: headers.authorization?.length || 0,
+        bodyPreview: previewString(body, 1200),
       });
     }
     let resp;
     try {
+      const t0 = Date.now();
       resp = await fetch(upstreamUrl, {
         method: "POST",
         headers,
         body,
       });
+      if (debug) {
+        logDebug(debug, reqId, "openai upstream response", {
+          url: upstreamUrl,
+          variant: i,
+          status: resp.status,
+          ok: resp.ok,
+          contentType: resp.headers.get("content-type") || "",
+          elapsedMs: Date.now() - t0,
+        });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "fetch failed";
       return { ok: false, status: 502, error: jsonError(`Upstream fetch failed: ${message}`, "bad_gateway"), upstreamUrl };
@@ -1774,7 +1881,7 @@ async function isProbablyEmptyEventStream(resp) {
   }
 }
 
-async function selectUpstreamResponseAny(upstreamUrls, headers, variants, debug = false) {
+async function selectUpstreamResponseAny(upstreamUrls, headers, variants, debug = false, reqId = "") {
   const urls = Array.isArray(upstreamUrls) ? upstreamUrls.filter(Boolean) : [];
   if (!urls.length) {
     return { ok: false, status: 500, error: jsonError("Server misconfigured: empty upstream URL list", "server_error") };
@@ -1782,10 +1889,10 @@ async function selectUpstreamResponseAny(upstreamUrls, headers, variants, debug 
 
   let firstErr = null;
   for (const url of urls) {
-    if (debug) console.log("rsp2com debug upstreamTry", url);
-    const sel = await selectUpstreamResponse(url, headers, variants, debug);
+    if (debug) logDebug(debug, reqId, "openai upstream try", { url });
+    const sel = await selectUpstreamResponse(url, headers, variants, debug, reqId);
     if (debug && !sel.ok) {
-      console.log("rsp2com debug upstreamTryFailed", {
+      logDebug(debug, reqId, "openai upstream try failed", {
         upstreamUrl: sel.upstreamUrl,
         status: sel.status,
         error: sel.error,
@@ -2062,11 +2169,34 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
-    const debug = request.headers.get("x-rsp2com-debug") === "1";
+    const reqId = crypto.randomUUID();
+    const debug = isDebugEnabled(env);
+    const startedAt = Date.now();
 
-    const workerAuthKey = normalizeAuthValue(env.WORKER_AUTH_KEY);
-    if (!workerAuthKey) {
-      return jsonResponse(500, jsonError("Server misconfigured: missing WORKER_AUTH_KEY", "server_error"));
+    if (debug) {
+      const authHeader = request.headers.get("authorization") || "";
+      const hasBearer = typeof authHeader === "string" && authHeader.toLowerCase().includes("bearer ");
+      const xApiKey = request.headers.get("x-api-key") || "";
+      logDebug(debug, reqId, "inbound request", {
+        method: request.method,
+        host: url.host,
+        path,
+        search: url.search || "",
+        userAgent: request.headers.get("user-agent") || "",
+        cfRay: request.headers.get("cf-ray") || "",
+        hasAuthorization: Boolean(authHeader),
+        authScheme: hasBearer ? "bearer" : authHeader ? "custom" : "",
+        authorizationLen: typeof authHeader === "string" ? authHeader.length : 0,
+        hasXApiKey: Boolean(xApiKey),
+        xApiKeyLen: typeof xApiKey === "string" ? xApiKey.length : 0,
+        contentType: request.headers.get("content-type") || "",
+        contentLength: request.headers.get("content-length") || "",
+      });
+    }
+
+    const workerAuthKeys = getWorkerAuthKeys(env);
+    if (!workerAuthKeys.length) {
+      return jsonResponse(500, jsonError("Server misconfigured: missing WORKER_AUTH_KEY/WORKER_AUTH_KEYS", "server_error"));
     }
 
     const authHeader = request.headers.get("authorization");
@@ -2085,11 +2215,15 @@ export default {
         headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "www-authenticate": "Bearer" },
       });
     }
-    if (token !== workerAuthKey) {
+    if (!workerAuthKeys.includes(token)) {
       return new Response(JSON.stringify(jsonError("Unauthorized", "unauthorized")), {
         status: 401,
         headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "www-authenticate": "Bearer" },
       });
+    }
+
+    if (debug) {
+      logDebug(debug, reqId, "auth ok", { tokenLen: token.length, authKeyCount: workerAuthKeys.length });
     }
 
     if (request.method === "GET" && (path === "/health" || path === "/v1/health")) {
@@ -2101,6 +2235,9 @@ export default {
       const modelIds = modelsEnv
         ? modelsEnv.split(",").map((m) => m.trim()).filter(Boolean)
         : [env.DEFAULT_MODEL || "gpt-5.2"];
+      if (debug) {
+        logDebug(debug, reqId, "models list", { count: modelIds.length, defaultModel: env.DEFAULT_MODEL || "gpt-5.2" });
+      }
       return jsonResponse(200, {
         object: "list",
         data: modelIds.map((id) => ({ id, object: "model", created: 0, owned_by: "openai" })),
@@ -2129,6 +2266,21 @@ export default {
     const stream = Boolean(reqJson.stream);
     const isTextCompletions = path === "/v1/completions" || path === "/completions";
     const isChatCompletions = path === "/v1/chat/completions" || path === "/chat/completions";
+
+    if (debug) {
+      logDebug(debug, reqId, "request parsed", {
+        model,
+        stream,
+        endpoint: isTextCompletions ? "completions" : isChatCompletions ? "chat.completions" : "unknown",
+        hasTools: Array.isArray(reqJson.tools) && reqJson.tools.length > 0,
+        toolCount: Array.isArray(reqJson.tools) ? reqJson.tools.length : 0,
+        hasToolChoice: reqJson.tool_choice != null,
+        hasMessages: Array.isArray(reqJson.messages),
+        messagesCount: Array.isArray(reqJson.messages) ? reqJson.messages.length : 0,
+        hasPrompt: "prompt" in reqJson,
+        maxTokens: Number.isInteger(reqJson.max_tokens) ? reqJson.max_tokens : Number.isInteger(reqJson.max_completion_tokens) ? reqJson.max_completion_tokens : null,
+      });
+    }
 
     // Gemini adapter: OpenAI Chat Completions -> Gemini (generateContent / streamGenerateContent).
     if (isChatCompletions && isGeminiModelId(model)) {
@@ -2162,23 +2314,36 @@ export default {
         "x-goog-api-key": geminiKey,
       };
 
-      // Debug: log Gemini request
-      console.log("rsp2com geminiRequest", {
-        url: geminiUrl,
-        originalModel: model,
-        normalizedModel: geminiModelId,
-        contentsCount: geminiBody.contents?.length || 0,
-        hasSystemInstruction: !!geminiBody.systemInstruction,
-        hasTools: !!geminiBody.tools,
-        stream: stream,
-      });
-      console.log("rsp2com geminiBody keys:", Object.keys(geminiBody));
+      if (debug) {
+        const geminiBodyLog = safeJsonStringifyForLog(geminiBody);
+        logDebug(debug, reqId, "gemini request", {
+          url: geminiUrl,
+          originalModel: model,
+          normalizedModel: geminiModelId,
+          stream,
+          sessionKey: sessionKey ? maskSecret(sessionKey) : "",
+          thoughtSigCacheEntries: sessionKey ? Object.keys(thoughtSigCache).length : 0,
+          headers: redactHeadersForLog(geminiHeaders),
+          bodyLen: geminiBodyLog.length,
+          bodyPreview: previewString(geminiBodyLog, 2400),
+        });
+      }
 
       let gemResp;
       try {
+        const t0 = Date.now();
         gemResp = await fetch(geminiUrl, { method: "POST", headers: geminiHeaders, body: JSON.stringify(geminiBody) });
+        if (debug) {
+          logDebug(debug, reqId, "gemini response headers", {
+            status: gemResp.status,
+            ok: gemResp.ok,
+            contentType: gemResp.headers.get("content-type") || "",
+            elapsedMs: Date.now() - t0,
+          });
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : "fetch failed";
+        if (debug) logDebug(debug, reqId, "gemini fetch error", { error: message });
         return jsonResponse(502, jsonError(`Upstream fetch failed: ${message}`, "bad_gateway"));
       }
 
@@ -2187,7 +2352,7 @@ export default {
         try {
           rawErr = await gemResp.text();
         } catch {}
-        console.log("rsp2com geminiError", { status: gemResp.status, error: rawErr.slice(0, 500) });
+        if (debug) logDebug(debug, reqId, "gemini upstream error", { status: gemResp.status, errorPreview: previewString(rawErr, 1200) });
         let message = `Gemini upstream error (status ${gemResp.status})`;
         try {
           const obj = JSON.parse(rawErr);
@@ -2209,6 +2374,15 @@ export default {
         }
 
         const { text, toolCalls, finish_reason, usage } = geminiExtractTextAndToolCalls(gjson);
+        if (debug) {
+          logDebug(debug, reqId, "gemini parsed", {
+            finish_reason,
+            textLen: typeof text === "string" ? text.length : 0,
+            textPreview: typeof text === "string" ? previewString(text, 800) : "",
+            toolCalls: toolCalls.map((c) => ({ name: c.function?.name || "", id: c.id || "", argsLen: c.function?.arguments?.length || 0, hasThoughtSig: !!c.thought_signature })),
+            usage: usage || null,
+          });
+        }
         const created = Math.floor(Date.now() / 1000);
         const toolCallsOut = toolCalls.map((c) => {
           // Return standard OpenAI format without thought_signature (cached internally)
@@ -2250,6 +2424,8 @@ export default {
       let raw = "";
       let textSoFar = "";
       let lastFinishReason = "";
+      let bytesIn = 0;
+      let sseDataLines = 0;
 
       const toolCallKeyToMeta = new Map(); // key -> { id, index, name, args }
       let nextToolIndex = 0;
@@ -2360,12 +2536,14 @@ export default {
             const { done, value } = await reader.read();
             if (done) break;
             const chunkText = decoder.decode(value, { stream: true });
+            bytesIn += chunkText.length;
             raw += chunkText;
             buf += chunkText;
             const lines = buf.split("\n");
             buf = lines.pop() || "";
             for (const line of lines) {
               if (!line.startsWith("data:")) continue;
+              sseDataLines++;
               sawDataLine = true;
               const data = line.slice(5).trim();
               if (!data) continue;
@@ -2443,10 +2621,14 @@ export default {
           try {
             await reader.cancel();
           } catch {}
-        } catch {
-          // ignore
+        } catch (err) {
+          if (debug) {
+            const message = err instanceof Error ? err.message : String(err ?? "stream failed");
+            logDebug(debug, reqId, "gemini stream translate error", { error: message });
+          }
         } finally {
           if (!sawDataLine && raw.trim()) {
+            if (debug) logDebug(debug, reqId, "gemini stream non-sse sample", { rawPreview: previewString(raw, 1200) });
             try {
               const obj = JSON.parse(raw);
               const extracted = geminiExtractTextAndToolCalls(obj);
@@ -2458,6 +2640,15 @@ export default {
             } catch {
               // ignore
             }
+          }
+          if (debug) {
+            logDebug(debug, reqId, "gemini stream summary", {
+              bytesIn,
+              sseDataLines,
+              toolCalls: Array.from(toolCallKeyToMeta.values()).map((m) => ({ name: m.name || "", id: m.id || "", argsLen: m.args?.length || 0, hasThoughtSig: !!m.thought_signature })),
+              finish_reason: geminiFinishReasonToOpenai(lastFinishReason, toolCallKeyToMeta.size > 0),
+              textLen: textSoFar.length,
+            });
           }
 
           if (!sentFinal) {
@@ -2506,22 +2697,25 @@ export default {
       if (!claudeKey) return jsonResponse(500, jsonError("Server misconfigured: missing CLAUDE_API_KEY", "server_error"));
 
       const claudeUrls = buildClaudeMessagesUrls(claudeBase, env.CLAUDE_MESSAGES_PATH);
-      if (debug) console.log("rsp2com debug claudeUrls", claudeUrls);
+      if (debug) logDebug(debug, reqId, "claude upstream urls", { urls: claudeUrls });
       if (!claudeUrls.length) return jsonResponse(500, jsonError("Server misconfigured: invalid CLAUDE_BASE_URL", "server_error"));
 
       const claudeModel = normalizeClaudeModelId(model, env);
       const { messages: claudeMessages, system: claudeSystem } = openaiChatToClaudeMessages(reqJson.messages || []);
       const claudeTools = openaiToolsToClaude(reqJson.tools);
 
-      // Debug: log tools info
-      console.log("rsp2com claudeRequest", {
-        model: claudeModel,
-        messagesCount: claudeMessages.length,
-        hasSystem: !!claudeSystem,
-        toolsCount: claudeTools.length,
-        reqToolsCount: (reqJson.tools || []).length,
-        stream: stream,
-      });
+      if (debug) {
+        logDebug(debug, reqId, "claude request build", {
+          originalModel: model,
+          normalizedModel: claudeModel,
+          stream,
+          messagesCount: claudeMessages.length,
+          hasSystem: !!claudeSystem,
+          systemLen: typeof claudeSystem === "string" ? claudeSystem.length : 0,
+          toolsCount: claudeTools.length,
+          reqToolsCount: Array.isArray(reqJson.tools) ? reqJson.tools.length : 0,
+        });
+      }
 
       let maxTokens = 8192;
       const maxTokensCap = typeof env.CLAUDE_MAX_TOKENS === "string" ? parseInt(env.CLAUDE_MAX_TOKENS, 10) : 8192;
@@ -2545,14 +2739,33 @@ export default {
         "anthropic-version": "2023-06-01",
       };
       if (claudeTools.length) claudeHeaders["anthropic-beta"] = "tools-2024-04-04";
+      if (debug) {
+        const claudeBodyLog = safeJsonStringifyForLog(claudeBody);
+        logDebug(debug, reqId, "claude request", {
+          urlsCount: claudeUrls.length,
+          headers: redactHeadersForLog(claudeHeaders),
+          bodyLen: claudeBodyLog.length,
+          bodyPreview: previewString(claudeBodyLog, 2400),
+        });
+      }
 
       let claudeResp = null;
       let claudeUrl = "";
       let lastClaudeError = "";
       for (const url of claudeUrls) {
-        if (debug) console.log("rsp2com debug claudeTry", url);
+        if (debug) logDebug(debug, reqId, "claude upstream try", { url });
         try {
+          const t0 = Date.now();
           const resp = await fetch(url, { method: "POST", headers: claudeHeaders, body: JSON.stringify(claudeBody) });
+          if (debug) {
+            logDebug(debug, reqId, "claude upstream response", {
+              url,
+              status: resp.status,
+              ok: resp.ok,
+              contentType: resp.headers.get("content-type") || "",
+              elapsedMs: Date.now() - t0,
+            });
+          }
           if (resp.ok) {
             claudeResp = resp;
             claudeUrl = url;
@@ -2560,10 +2773,11 @@ export default {
           }
           const errText = await resp.text().catch(() => "");
           lastClaudeError = errText;
-          console.log("rsp2com claudeTryFailed", { url, status: resp.status, error: errText.slice(0, 500) });
+          if (debug) logDebug(debug, reqId, "claude upstream error", { url, status: resp.status, errorPreview: previewString(errText, 1200) });
         } catch (err) {
-          lastClaudeError = err.message;
-          console.log("rsp2com claudeFetchError", { url, error: err.message });
+          const message = err instanceof Error ? err.message : String(err ?? "fetch failed");
+          lastClaudeError = message;
+          if (debug) logDebug(debug, reqId, "claude fetch error", { url, error: message });
         }
       }
 
@@ -2585,6 +2799,17 @@ export default {
         const { text, toolCalls } = claudeExtractTextAndToolCalls(cjson.content);
         const finishReason = claudeStopReasonToOpenai(cjson.stop_reason);
         const usage = claudeUsageToOpenaiUsage(cjson.usage);
+        if (debug) {
+          logDebug(debug, reqId, "claude parsed", {
+            url: claudeUrl,
+            finish_reason: finishReason,
+            stop_reason: cjson.stop_reason || "",
+            textLen: typeof text === "string" ? text.length : 0,
+            textPreview: typeof text === "string" ? previewString(text, 800) : "",
+            toolCalls: toolCalls.map((c) => ({ name: c.function?.name || "", id: c.id || "", argsLen: c.function?.arguments?.length || 0 })),
+            usage: usage || null,
+          });
+        }
 
         const message = { role: "assistant", content: text || null };
         if (toolCalls.length) message.tool_calls = toolCalls;
@@ -2605,15 +2830,16 @@ export default {
       const encoder = new TextEncoder();
 
       (async () => {
+        const streamStartedAt = Date.now();
+        let textContent = "";
+        const toolCalls = [];
+        let finishReason = "stop";
         try {
           const reader = claudeResp.body.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
-          let textContent = "";
-          const toolCalls = [];
           const toolCallArgs = {}; // Map tool_use index to accumulated arguments
           let currentToolIndex = -1;
-          let finishReason = "stop";
 
           while (true) {
             const { done, value } = await reader.read();
@@ -2719,8 +2945,18 @@ export default {
           await writer.write(encoder.encode(encodeSseData(JSON.stringify(finalChunk))));
           await writer.write(encoder.encode(encodeSseData("[DONE]")));
         } catch (err) {
-          console.log("rsp2com claudeStreamError", err.message);
+          const message = err instanceof Error ? err.message : String(err ?? "stream error");
+          if (debug) logDebug(debug, reqId, "claude stream error", { error: message });
         } finally {
+          if (debug) {
+            logDebug(debug, reqId, "claude stream summary", {
+              url: claudeUrl,
+              elapsedMs: Date.now() - streamStartedAt,
+              textLen: textContent.length,
+              toolCallsCount: toolCalls.length,
+              finish_reason: finishReason,
+            });
+          }
           try { await writer.close(); } catch {}
         }
       })();
@@ -2734,7 +2970,7 @@ export default {
     if (!upstreamKey) return jsonResponse(500, jsonError("Server misconfigured: missing OPENAI_API_KEY", "server_error"));
 
     const upstreamUrls = buildUpstreamUrls(upstreamBase, env.RESP_RESPONSES_PATH);
-    if (debug) console.log("rsp2com debug upstreamUrls", upstreamUrls);
+    if (debug) logDebug(debug, reqId, "openai upstream urls", { urls: upstreamUrls });
     // Some gateways (including Codex SDK style proxies) require upstream `stream: true`.
     // We can still serve non-stream clients by buffering the SSE output into a single JSON response.
     const upstreamStream = true;
@@ -2747,6 +2983,7 @@ export default {
       "x-goog-api-key": upstreamKey,
       "openai-beta": "responses=v1",
     };
+    if (debug) logDebug(debug, reqId, "openai upstream headers", { headers: redactHeadersForLog(headers) });
 
     const reasoningEffort = getReasoningEffort(reqJson, env);
     if (isTextCompletions) {
@@ -2763,22 +3000,25 @@ export default {
       if ("stop" in reqJson) responsesReq.stop = reqJson.stop;
 
       const variants = responsesReqVariants(responsesReq, upstreamStream);
-      const sel = await selectUpstreamResponseAny(upstreamUrls, headers, variants, debug);
-      if (!sel.ok && debug) {
-        console.log("rsp2com debug upstreamFailed", {
-          path,
-          upstreamUrl: sel.upstreamUrl,
-          status: sel.status,
-          error: sel.error,
+      if (debug) {
+        const reqLog = safeJsonStringifyForLog(responsesReq);
+        logDebug(debug, reqId, "openai completions request", {
+          variants: variants.length,
+          requestLen: reqLog.length,
+          requestPreview: previewString(reqLog, 2400),
         });
+      }
+      const sel = await selectUpstreamResponseAny(upstreamUrls, headers, variants, debug, reqId);
+      if (!sel.ok && debug) {
+        logDebug(debug, reqId, "openai upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
       }
       if (!sel.ok) return jsonResponse(sel.status, sel.error);
       if (debug) {
-        console.log("rsp2com debug upstreamSelected", {
+        logDebug(debug, reqId, "openai upstream selected", {
           path,
           upstreamUrl: sel.upstreamUrl,
           status: sel.resp.status,
-          contentType: sel.resp.headers.get("content-type"),
+          contentType: sel.resp.headers.get("content-type") || "",
         });
       }
 
@@ -2859,7 +3099,17 @@ export default {
           }
         }
         if (debug && !sawDataLine) {
-          console.log("rsp2com debug upstreamNonSseSample", raw.slice(0, 500));
+          logDebug(debug, reqId, "openai upstream non-sse sample", { rawPreview: previewString(raw, 1200) });
+        }
+        if (debug) {
+          logDebug(debug, reqId, "openai completions parsed", {
+            textLen: fullText.length,
+            textPreview: previewString(fullText, 800),
+            sawDataLine,
+            sawDelta,
+            sawAnyText,
+            rawLen: raw.length,
+          });
         }
         const created = Math.floor(Date.now() / 1000);
         return jsonResponse(200, {
@@ -2879,6 +3129,7 @@ export default {
       const encoder = new TextEncoder();
 
       (async () => {
+        const streamStartedAt = Date.now();
         let sentFinal = false;
         let sawDelta = false;
         let sentAnyText = false;
@@ -2967,11 +3218,14 @@ export default {
           try {
             await reader.cancel();
           } catch {}
-        } catch {
-          // ignore
+        } catch (err) {
+          if (debug) {
+            const message = err instanceof Error ? err.message : String(err ?? "stream error");
+            logDebug(debug, reqId, "openai completions stream error", { error: message });
+          }
         } finally {
           if (!sawDataLine && !sentAnyText && raw.trim()) {
-            if (debug) console.log("rsp2com debug upstreamNonSseSample", raw.slice(0, 500));
+            if (debug) logDebug(debug, reqId, "openai upstream non-sse sample", { rawPreview: previewString(raw, 1200) });
             try {
               const obj = JSON.parse(raw);
               if (typeof obj === "string") {
@@ -3023,6 +3277,16 @@ export default {
           try {
             await writer.close();
           } catch {}
+          if (debug) {
+            logDebug(debug, reqId, "openai completions stream summary", {
+              completionId,
+              elapsedMs: Date.now() - streamStartedAt,
+              sentAnyText,
+              sawDelta,
+              sawDataLine,
+              rawLen: raw.length,
+            });
+          }
         }
       })();
 
@@ -3034,6 +3298,7 @@ export default {
     if (!Array.isArray(messages)) return jsonResponse(400, jsonError("Missing required field: messages"));
 
     const sessionKey = getSessionKey(request, reqJson, token);
+    if (debug) logDebug(debug, reqId, "openai session", { sessionKey: sessionKey ? maskSecret(sessionKey) : "", multiTurnPossible: hasAssistantMessage(messages) });
 
     const { instructions, input } = chatMessagesToResponsesInput(messages);
     if (!input.length) return jsonResponse(400, jsonError("messages must include at least one non-system message"));
@@ -3093,29 +3358,42 @@ export default {
 
     const primaryReq = prevReq || fullReq;
     const primaryVariants = responsesReqVariants(primaryReq, upstreamStream);
-    let sel = await selectUpstreamResponseAny(upstreamUrls, headers, primaryVariants, debug);
+    if (debug) {
+      const reqLog = safeJsonStringifyForLog(primaryReq);
+      logDebug(debug, reqId, "openai chat request", {
+        usingPreviousResponseId: Boolean(prevReq?.previous_response_id),
+        previous_response_id: prevReq?.previous_response_id ? maskSecret(prevReq.previous_response_id) : "",
+        deltaMessagesCount: deltaMessages.length,
+        totalMessagesCount: messages.length,
+        inputItems: Array.isArray(primaryReq?.input) ? primaryReq.input.length : 0,
+        hasInstructions: Boolean(primaryReq?.instructions),
+        instructionsLen: typeof primaryReq?.instructions === "string" ? primaryReq.instructions.length : 0,
+        toolsCount: Array.isArray(primaryReq?.tools) ? primaryReq.tools.length : 0,
+        toolChoice: primaryReq?.tool_choice ?? null,
+        max_output_tokens: primaryReq?.max_output_tokens ?? null,
+        variants: primaryVariants.length,
+        requestLen: reqLog.length,
+        requestPreview: previewString(reqLog, 2400),
+      });
+    }
+    let sel = await selectUpstreamResponseAny(upstreamUrls, headers, primaryVariants, debug, reqId);
 
     // If the upstream doesn't accept `previous_response_id`, fall back to full history.
     if (!sel.ok && prevReq) {
       const fallbackVariants = responsesReqVariants(fullReq, upstreamStream);
-      const sel2 = await selectUpstreamResponseAny(upstreamUrls, headers, fallbackVariants, debug);
+      const sel2 = await selectUpstreamResponseAny(upstreamUrls, headers, fallbackVariants, debug, reqId);
       if (sel2.ok) sel = sel2;
     }
     if (!sel.ok && debug) {
-      console.log("rsp2com debug upstreamFailed", {
-        path,
-        upstreamUrl: sel.upstreamUrl,
-        status: sel.status,
-        error: sel.error,
-      });
+      logDebug(debug, reqId, "openai upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
     }
     if (!sel.ok) return jsonResponse(sel.status, sel.error);
     if (debug) {
-      console.log("rsp2com debug upstreamSelected", {
+      logDebug(debug, reqId, "openai upstream selected", {
         path,
         upstreamUrl: sel.upstreamUrl,
         status: sel.resp.status,
-        contentType: sel.resp.headers.get("content-type"),
+        contentType: sel.resp.headers.get("content-type") || "",
       });
     }
 
@@ -3251,10 +3529,13 @@ export default {
         }
       }
       if (debug && !sawDataLine) {
-        console.log("rsp2com debug upstreamNonSseSample", raw.slice(0, 500));
+        logDebug(debug, reqId, "openai upstream non-sse sample", { rawPreview: previewString(raw, 1200) });
       }
       const created = Math.floor(Date.now() / 1000);
-      if (responseId) await setSessionPreviousResponseId(sessionKey, responseId);
+      if (responseId) {
+        await setSessionPreviousResponseId(sessionKey, responseId);
+        if (debug) logDebug(debug, reqId, "openai session cache set", { previous_response_id: maskSecret(responseId) });
+      }
       const outId = responseId ? `chatcmpl_${responseId}` : `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
       const toolCalls = Array.from(toolCallsById.entries()).map(([id, v]) => ({
         id,
@@ -3263,6 +3544,24 @@ export default {
       }));
       const finishReason = toolCalls.length ? "tool_calls" : "stop";
       const contentValue = fullText && fullText.length ? fullText : toolCalls.length ? null : "";
+      if (debug) {
+        logDebug(debug, reqId, "openai chat parsed", {
+          responseId: responseId ? maskSecret(responseId) : "",
+          outId,
+          finish_reason: finishReason,
+          textLen: fullText.length,
+          textPreview: previewString(fullText, 800),
+          toolCalls: toolCalls.map((c) => ({
+            id: c.id,
+            name: c.function?.name || "",
+            argsLen: c.function?.arguments?.length || 0,
+          })),
+          sawDataLine,
+          sawDelta,
+          sawAnyText,
+          rawLen: raw.length,
+        });
+      }
       return jsonResponse(200, {
         id: outId,
         object: "chat.completion",
@@ -3299,6 +3598,7 @@ export default {
     const encoder = new TextEncoder();
 
     (async () => {
+      const streamStartedAt = Date.now();
       const getToolCallIndex = (callId) => {
         const id = typeof callId === "string" ? callId.trim() : "";
         if (!id) return 0;
@@ -3517,11 +3817,14 @@ export default {
         try {
           await reader.cancel();
         } catch {}
-      } catch {
-        // ignore
+      } catch (err) {
+        if (debug) {
+          const message = err instanceof Error ? err.message : String(err ?? "stream error");
+          logDebug(debug, reqId, "openai stream translate error", { error: message });
+        }
       } finally {
         if (!sawDataLine && raw.trim()) {
-          if (debug) console.log("rsp2com debug upstreamNonSseSample", raw.slice(0, 500));
+          if (debug) logDebug(debug, reqId, "openai upstream non-sse sample", { rawPreview: previewString(raw, 1200) });
           try {
             const obj = JSON.parse(raw);
             if (typeof obj === "string") {
@@ -3602,9 +3905,29 @@ export default {
           await writer.close();
         } catch {}
         if (responseId) await setSessionPreviousResponseId(sessionKey, responseId);
+        if (debug) {
+          const finishReason = toolCallsById.size ? "tool_calls" : "stop";
+          logDebug(debug, reqId, "openai stream summary", {
+            elapsedMs: Date.now() - streamStartedAt,
+            responseId: responseId ? maskSecret(responseId) : "",
+            outModel,
+            sentAnyText,
+            sawToolCall,
+            sawDataLine,
+            rawLen: raw.length,
+            finish_reason: finishReason,
+            toolCallsCount: toolCallsById.size,
+            toolCalls: Array.from(toolCallsById.entries()).map(([id, v]) => ({
+              id,
+              name: v?.name || "",
+              argsLen: typeof v?.args === "string" ? v.args.length : 0,
+            })),
+          });
+        }
       }
     })();
 
+    if (debug) logDebug(debug, reqId, "request done", { elapsedMs: Date.now() - startedAt });
     return new Response(readable, { status: 200, headers: sseHeaders() });
   },
 };

@@ -28,7 +28,7 @@ OPENAI_BASE_URL = "https://your-relay-server.example/openai"
 # CLAUDE_MAX_TOKENS = 8192 # optional: set 0 to disable cap
 
 # Debug logging (optional)
-# RSP4COPILOT_DEBUG = "1" # set "0" to disable
+# RSP4COPILOT_DEBUG = "true" # set "false"/"0" to disable
 
 # Default model for /v1/models endpoint
 DEFAULT_MODEL = "gpt-5.2"
@@ -46,6 +46,8 @@ ADAPTER_MODELS = "gpt-5.1,gpt-5.1-codex-max,gpt-5.2,gpt-5.2-codex,gemini-3-flash
 #   wrangler secret put GEMINI_API_KEY
 #   wrangler secret put CLAUDE_API_KEY
 #   wrangler secret put WORKER_AUTH_KEY
+# Optional: multiple client auth keys (comma-separated):
+#   wrangler secret put WORKER_AUTH_KEYS
 
 [observability]
 enabled = true
