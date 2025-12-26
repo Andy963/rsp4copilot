@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+dist/
+*.log
+.dev.vars
+wrangler.toml
+tsconfig.json
+oai-compatible-copilot/

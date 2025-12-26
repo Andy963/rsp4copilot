@@ -1,0 +1,51 @@
+name = "rsp4copilot"
+main = "worker.js"
+compatibility_date = "2025-12-24"
+workers_dev = true
+preview_urls = true
+
+# Optional: Custom domain routing (uncomment and modify)
+# [[routes]]
+# pattern = "your-domain.com/v1/*"
+# zone_name = "your-domain.com"
+
+[vars]
+# NOTE: This project is designed for relay servers (e.g. Claude Relay Server),
+#       NOT for direct official API connections.
+#       Replace the URLs below with your relay server addresses.
+
+# OpenAI Responses API upstream (required for non-Gemini/Claude models)
+OPENAI_BASE_URL = "https://your-relay-server.example/openai"
+
+# Gemini API upstream (optional, for Gemini models)
+# GEMINI_BASE_URL = "https://your-relay-server.example/gemini"
+# GEMINI_DEFAULT_MODEL = "gemini-3-pro-preview"
+
+# Claude API upstream (optional, for Claude models)
+# CLAUDE_BASE_URL = "https://your-relay-server.example/api"
+# CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
+# CLAUDE_MESSAGES_PATH = "/messages" # optional: override inferred path (or use "/v1/messages")
+# CLAUDE_MAX_TOKENS = 8192 # optional: set 0 to disable cap
+
+# Debug logging (optional)
+# RSP4COPILOT_DEBUG = "1" # set "0" to disable
+
+# Default model for /v1/models endpoint
+DEFAULT_MODEL = "gpt-5.2"
+
+# Models to list in /v1/models (comma-separated)
+# Include all models you want to expose through this worker
+ADAPTER_MODELS = "gpt-5.1,gpt-5.1-codex-max,gpt-5.2,gpt-5.2-codex,gemini-3-flash-preview,gemini-3-pro-preview,claude-haiku-4-5-20251001,claude-sonnet-4-5-20250929,claude-opus-4-5-20251101"
+
+# Reasoning effort for OpenAI Responses API (optional)
+# Values: "low" | "medium" | "high" | "off"
+# RESP_REASONING_EFFORT = "low"
+
+# Secrets (do not commit to git, use wrangler secret put):
+#   wrangler secret put OPENAI_API_KEY
+#   wrangler secret put GEMINI_API_KEY
+#   wrangler secret put CLAUDE_API_KEY
+#   wrangler secret put WORKER_AUTH_KEY
+
+[observability]
+enabled = true
