@@ -1385,7 +1385,42 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
   // Cache for looking up thought_signature by call_id
   const sigCache = thoughtSigCache && typeof thoughtSigCache === "object" ? thoughtSigCache : {};
 
-  for (const msg of messages) {
+  const toolMessageToFunctionResponsePart = (msg, fallbackName = "") => {
+    if (!msg || typeof msg !== "object") return null;
+    const callIdRaw = msg.tool_call_id ?? msg.toolCallId ?? msg.call_id ?? msg.callId ?? msg.id;
+    const callId = typeof callIdRaw === "string" ? callIdRaw.trim() : "";
+    const mappedName = callId ? toolNameByCallId.get(callId) || "" : "";
+    const name = mappedName || fallbackName || "";
+    if (!name) return null;
+
+    const content = msg.content;
+    const raw =
+      typeof content === "string"
+        ? content
+        : content == null
+          ? ""
+          : (() => {
+              try {
+                return JSON.stringify(content);
+              } catch {
+                return String(content);
+              }
+            })();
+    const rawText = typeof raw === "string" ? raw : String(raw ?? "");
+
+    const parsed = safeJsonParse(rawText);
+    let responseValue = { output: rawText };
+    if (parsed.ok) {
+      const v = parsed.value;
+      if (v != null && typeof v === "object" && !Array.isArray(v)) responseValue = v;
+      else responseValue = { output: v };
+    }
+
+    return { callId, part: { functionResponse: { name, response: responseValue } } };
+  };
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
     if (!msg || typeof msg !== "object") continue;
     const roleRaw = typeof msg.role === "string" ? msg.role : "user";
 
@@ -1407,8 +1442,10 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
       if (txt && String(txt).trim()) parts.push({ text: String(txt) });
 
       const calls = normalizeToolCallsFromChatMessage(msg);
+      const callOrder = [];
       for (const c of calls) {
         toolNameByCallId.set(c.call_id, c.name);
+        callOrder.push({ call_id: c.call_id, name: c.name });
         const parsedArgs = safeJsonParse(c.arguments);
         
         // Try to get thought_signature from message first, then from cache
@@ -1439,28 +1476,57 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
       }
 
       if (parts.length) contents.push({ role: "model", parts });
+
+      // Gemini requires that tool responses are provided as a single "user" turn
+      // containing the same number of functionResponse parts as the preceding model's functionCall parts.
+      if (calls.length) {
+        const responsesByCallId = new Map();
+        let j = i + 1;
+        while (j < messages.length) {
+          const m2 = messages[j];
+          if (!m2 || typeof m2 !== "object") break;
+          const r2 = typeof m2.role === "string" ? m2.role : "";
+          if (r2 !== "tool") break;
+
+          const item = toolMessageToFunctionResponsePart(m2);
+          if (item && item.callId) responsesByCallId.set(item.callId, item.part);
+          j++;
+        }
+
+        // Only emit functionResponses if the history actually includes tool messages for this turn.
+        if (j > i + 1) {
+          const respParts = [];
+          for (const c of callOrder) {
+            const found = responsesByCallId.get(c.call_id);
+            if (found) {
+              respParts.push(found);
+            } else {
+              // Keep the turn structurally valid even if a tool result is missing.
+              respParts.push({ functionResponse: { name: c.name, response: { output: "" } } });
+            }
+          }
+          contents.push({ role: "user", parts: respParts });
+          i = j - 1; // consume tool messages
+        }
+      }
       continue;
     }
 
     if (roleRaw === "tool") {
-      const callIdRaw = msg.tool_call_id ?? msg.toolCallId ?? msg.call_id ?? msg.callId ?? msg.id;
-      const callId = typeof callIdRaw === "string" ? callIdRaw.trim() : "";
-      const outputText = normalizeMessageContent(msg.content);
-      const name = callId ? toolNameByCallId.get(callId) || "" : "";
-      
-      if (!callId || !name) continue;
-      
-      contents.push({
-        role: "user",
-        parts: [
-          {
-            functionResponse: {
-              name,
-              response: { output: outputText ?? "" },
-            },
-          },
-        ],
-      });
+      // Best-effort: group consecutive tool results into a single turn.
+      const respParts = [];
+      let j = i;
+      while (j < messages.length) {
+        const m2 = messages[j];
+        if (!m2 || typeof m2 !== "object") break;
+        const r2 = typeof m2.role === "string" ? m2.role : "";
+        if (r2 !== "tool") break;
+        const item = toolMessageToFunctionResponsePart(m2);
+        if (item?.part) respParts.push(item.part);
+        j++;
+      }
+      if (respParts.length) contents.push({ role: "user", parts: respParts });
+      i = j - 1;
       continue;
     }
   }
