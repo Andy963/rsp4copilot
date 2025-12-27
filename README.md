@@ -96,7 +96,8 @@ npm run deploy
       "context_length": 400000,
       "max_tokens": 16384,
       "temperature": 0,
-      "top_p": 1
+      "top_p": 1,
+      "vision": true
     },
     {
       "id": "gpt-5.1-codex-max",
@@ -104,7 +105,8 @@ npm run deploy
       "context_length": 400000,
       "max_tokens": 128000,
       "temperature": 0,
-      "top_p": 1
+      "top_p": 1,
+      "vision": true
     },
     {
       "id": "gpt-5.2",
@@ -112,7 +114,8 @@ npm run deploy
       "context_length": 400000,
       "max_tokens": 16384,
       "temperature": 0,
-      "top_p": 1
+      "top_p": 1,
+      "vision": true
     },
     {
       "id": "gpt-5.2-codex",
@@ -120,7 +123,8 @@ npm run deploy
       "context_length": 400000,
       "max_tokens": 128000,
       "temperature": 0,
-      "top_p": 1
+      "top_p": 1,
+      "vision": true
     },
     {
       "id": "gemini-3-flash-preview",
@@ -128,7 +132,8 @@ npm run deploy
       "context_length": 1048576,
       "max_tokens": 65536,
       "temperature": 0,
-      "top_p": 1
+      "top_p": 1,
+      "vision": true
     },
     {
       "id": "gemini-3-pro-preview",
@@ -136,31 +141,35 @@ npm run deploy
       "context_length": 1048576,
       "max_tokens": 65536,
       "temperature": 0,
-      "top_p": 1
+      "top_p": 1,
+      "vision": true
     },
     {
       "id": "claude-haiku-4-5-20251001",
       "owned_by": "anthropic",
-      "context_length": 1048576,
-      "max_tokens": 8192,
+      "context_length": 2097152,
+      "max_tokens": 131072,
       "temperature": 0,
-      "top_p": 1
+      "top_p": 1,
+      "vision": true
     },
     {
       "id": "claude-sonnet-4-5-20250929",
       "owned_by": "anthropic",
       "context_length": 1048576,
-      "max_tokens": 8192,
+      "max_tokens": 65536,
       "temperature": 0,
-      "top_p": 1
+      "top_p": 1,
+      "vision": true
     },
     {
       "id": "claude-opus-4-5-20251101",
       "owned_by": "anthropic",
-      "context_length": 2097152,
-      "max_tokens": 8192,
+      "context_length": 1048576,
+      "max_tokens": 65536,
       "temperature": 0,
-      "top_p": 1
+      "top_p": 1,
+      "vision": true
     }
   ]
 }

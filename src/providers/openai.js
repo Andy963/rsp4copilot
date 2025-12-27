@@ -1,0 +1,1871 @@
+import {
+  appendInstructions,
+  applyTemperatureTopPFromRequest,
+  encodeSseData,
+  getSessionKey,
+  joinPathPrefix,
+  jsonError,
+  jsonResponse,
+  logDebug,
+  maskSecret,
+  normalizeAuthValue,
+  normalizeBaseUrl,
+  normalizeMessageContent,
+  normalizeToolCallsFromChatMessage,
+  previewString,
+  redactHeadersForLog,
+  safeJsonStringifyForLog,
+  sha256Hex,
+  sseHeaders,
+} from "../common.js";
+
+function buildUpstreamUrls(raw, responsesPathRaw) {
+  const value = (raw || "").trim();
+  if (!value) return [];
+
+  const configuredResponsesPath = (responsesPathRaw || "").trim();
+
+  const parts = value
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const out = [];
+  const pushUrl = (urlStr) => {
+    if (!urlStr || typeof urlStr !== "string") return;
+    if (!out.includes(urlStr)) out.push(urlStr);
+  };
+
+  const inferResponsesPath = (basePath) => {
+    const p = (basePath || "").replace(/\/+$/, "");
+    // If the base already ends with /v1, prefer appending /responses (avoid /v1/v1/responses).
+    // Many gateways use an "/openai" prefix that already maps to an upstream "/v1".
+    if (p.endsWith("/openai") || p.endsWith("/openai/v1")) return "/responses";
+    if (p.endsWith("/v1")) return "/responses";
+    return "/v1/responses";
+  };
+
+  for (const p of parts) {
+    try {
+      const normalized = normalizeBaseUrl(p);
+      const u0 = new URL(normalized);
+      const basePath = (u0.pathname || "").replace(/\/+$/, "") || "/";
+      const isFullEndpoint = basePath.endsWith("/v1/responses") || basePath.endsWith("/responses");
+
+      if (isFullEndpoint) {
+        u0.pathname = basePath;
+        u0.search = "";
+        u0.hash = "";
+        pushUrl(u0.toString());
+        continue;
+      }
+
+      // Treat as base/prefix: append responses path.
+      const preferred = configuredResponsesPath
+        ? configuredResponsesPath.startsWith("/")
+          ? configuredResponsesPath
+          : `/${configuredResponsesPath}`
+        : inferResponsesPath(basePath);
+      const candidates = [
+        joinPathPrefix(basePath, preferred),
+        joinPathPrefix(basePath, "/v1/responses"),
+        joinPathPrefix(basePath, "/responses"),
+      ];
+
+      for (const path of candidates) {
+        const u = new URL(normalized);
+        u.pathname = path;
+        u.search = "";
+        u.hash = "";
+        pushUrl(u.toString());
+      }
+    } catch {
+      // Ignore invalid URLs; caller will handle empty list.
+    }
+  }
+
+  return out;
+}
+
+function messageContentToResponsesParts(content) {
+  const out = [];
+
+  const normalizeMimeType = (v) => {
+    if (typeof v !== "string") return "";
+    const mt = v.trim();
+    return mt;
+  };
+
+  const getMimeType = (obj) => {
+    if (!obj || typeof obj !== "object") return "";
+    return (
+      normalizeMimeType(obj.mime_type) ||
+      normalizeMimeType(obj.mimeType) ||
+      normalizeMimeType(obj.media_type) ||
+      normalizeMimeType(obj.mediaType)
+    );
+  };
+
+  const isProbablyBase64 = (raw) => {
+    if (typeof raw !== "string") return false;
+    const s = raw.trim();
+    if (!s) return false;
+    if (s.startsWith("data:")) return false;
+    if (/^https?:\/\//i.test(s)) return false;
+    // Remove whitespace/newlines (common when base64 is wrapped).
+    const cleaned = s.replace(/\s+/g, "");
+    if (cleaned.length < 40) return false;
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned)) return false;
+    return true;
+  };
+
+  const pushText = (text) => {
+    if (typeof text !== "string") return;
+    if (!text) return;
+    out.push({ type: "input_text", text });
+  };
+
+  const pushImageUrl = (value, mimeType) => {
+    if (typeof value !== "string") return;
+    let v = value.trim();
+    if (!v) return;
+    if (isProbablyBase64(v)) {
+      const cleaned = v.replace(/\s+/g, "");
+      const mt = normalizeMimeType(mimeType) || "image/png";
+      v = `data:${mt};base64,${cleaned}`;
+    }
+    out.push({ type: "input_image", image_url: v });
+  };
+
+  const handlePart = (part) => {
+    if (part == null) return;
+    if (typeof part === "string") {
+      pushText(part);
+      return;
+    }
+    if (typeof part !== "object") {
+      pushText(String(part));
+      return;
+    }
+
+    const t = part.type;
+
+    if (t === "text" || t === "input_text" || t === "output_text") {
+      if (typeof part.text === "string") pushText(part.text);
+      return;
+    }
+
+    if (t === "image_url" || t === "input_image" || t === "image") {
+      const mimeType = getMimeType(part);
+      const v = part.image_url ?? part.url ?? part.image;
+      if (typeof v === "string") pushImageUrl(v, mimeType);
+      else if (v && typeof v === "object") {
+        const nestedMimeType = getMimeType(v) || mimeType;
+        if (typeof v.url === "string") pushImageUrl(v.url, nestedMimeType);
+        else {
+          const b64 = v.base64 ?? v.b64 ?? v.b64_json ?? v.data ?? v.image_base64 ?? v.imageBase64;
+          if (typeof b64 === "string") pushImageUrl(b64, nestedMimeType);
+        }
+      }
+      return;
+    }
+
+    // Handle objects without explicit type (best-effort).
+    if ("image_url" in part) {
+      const mimeType = getMimeType(part);
+      const v = part.image_url;
+      if (typeof v === "string") pushImageUrl(v, mimeType);
+      else if (v && typeof v === "object") {
+        const nestedMimeType = getMimeType(v) || mimeType;
+        if (typeof v.url === "string") pushImageUrl(v.url, nestedMimeType);
+        else {
+          const b64 = v.base64 ?? v.b64 ?? v.b64_json ?? v.data ?? v.image_base64 ?? v.imageBase64;
+          if (typeof b64 === "string") pushImageUrl(b64, nestedMimeType);
+        }
+      }
+      return;
+    }
+    if (typeof part.text === "string") {
+      pushText(part.text);
+      return;
+    }
+  };
+
+  if (Array.isArray(content)) {
+    for (const item of content) handlePart(item);
+    return out;
+  }
+
+  handlePart(content);
+  return out;
+}
+
+function openaiToolsToResponsesTools(tools) {
+  const list = Array.isArray(tools) ? tools : [];
+  const out = [];
+
+  for (const t of list) {
+    if (!t || typeof t !== "object") continue;
+    const type = t.type;
+
+    // Pass through non-function tools (Responses supports some native tool types).
+    if (type !== "function") {
+      out.push(t);
+      continue;
+    }
+
+    // Accept both shapes:
+    // - Chat Completions: { type:"function", function:{ name, description, parameters } }
+    // - Responses:       { type:"function", name, description, parameters }
+    const fn = t.function && typeof t.function === "object" ? t.function : null;
+    const nameRaw = typeof t.name === "string" ? t.name : fn && typeof fn.name === "string" ? fn.name : "";
+    const name = typeof nameRaw === "string" ? nameRaw.trim() : "";
+    if (!name) continue;
+
+    const description = typeof t.description === "string" ? t.description : fn && typeof fn.description === "string" ? fn.description : "";
+    const parameters =
+      t.parameters && typeof t.parameters === "object"
+        ? t.parameters
+        : fn && fn.parameters && typeof fn.parameters === "object"
+          ? fn.parameters
+          : null;
+
+    const tool = { type: "function", name };
+    if (typeof description === "string" && description.trim()) tool.description = description;
+    if (parameters) tool.parameters = parameters;
+    out.push(tool);
+  }
+
+  return out;
+}
+
+function openaiToolChoiceToResponsesToolChoice(toolChoice) {
+  if (toolChoice == null) return undefined;
+  if (typeof toolChoice === "string") return toolChoice;
+  if (typeof toolChoice !== "object") return undefined;
+
+  const type = toolChoice.type;
+  if (type !== "function") return toolChoice;
+
+  const nameRaw =
+    typeof toolChoice.name === "string"
+      ? toolChoice.name
+      : toolChoice.function && typeof toolChoice.function === "object" && typeof toolChoice.function.name === "string"
+        ? toolChoice.function.name
+        : "";
+  const name = typeof nameRaw === "string" ? nameRaw.trim() : "";
+  if (!name) return toolChoice;
+
+  return { type: "function", name };
+}
+
+function chatMessagesToResponsesInput(messages) {
+  const instructionsParts = [];
+  const inputItems = [];
+
+  for (const msg of Array.isArray(messages) ? messages : []) {
+    if (!msg || typeof msg !== "object") continue;
+    let role = msg.role || "user";
+
+    if (role === "system" || role === "developer") {
+      let contentText = normalizeMessageContent(msg.content);
+      if (!contentText.trim()) {
+        const reasoning = msg.reasoning_content;
+        if (typeof reasoning === "string" && reasoning.trim()) contentText = reasoning;
+      }
+      if (contentText.trim()) instructionsParts.push(contentText);
+      continue;
+    }
+
+    if (role === "tool") {
+      const callIdRaw = msg.tool_call_id ?? msg.toolCallId ?? msg.call_id ?? msg.callId ?? msg.id;
+      const callId = typeof callIdRaw === "string" ? callIdRaw.trim() : "";
+      const output = normalizeMessageContent(msg.content);
+      if (!callId) continue;
+      inputItems.push({ type: "function_call_output", call_id: callId, output: output ?? "" });
+      continue;
+    }
+
+    if (role === "assistant") {
+      const text = normalizeMessageContent(msg.content);
+      if (typeof text === "string" && text.trim()) {
+        inputItems.push({ role: "assistant", content: text });
+      } else {
+        const reasoning = msg.reasoning_content;
+        if (typeof reasoning === "string" && reasoning.trim()) {
+          inputItems.push({ role: "assistant", content: reasoning });
+        }
+      }
+
+      const calls = normalizeToolCallsFromChatMessage(msg);
+      for (const c of calls) {
+        const fcItem = {
+          type: "function_call",
+          id: `fc_${c.call_id}`,
+          call_id: c.call_id,
+          name: c.name,
+          arguments: c.arguments,
+        };
+        if (c.thought_signature) {
+          fcItem.thought_signature = c.thought_signature;
+        }
+        if (c.thought) {
+          fcItem.thought = c.thought;
+        }
+        inputItems.push(fcItem);
+      }
+      continue;
+    }
+
+    if (role !== "user") role = "user";
+    let contentParts = messageContentToResponsesParts(msg.content);
+    if (!contentParts.length) {
+      const reasoning = msg.reasoning_content;
+      if (typeof reasoning === "string" && reasoning.trim()) {
+        contentParts = [{ type: "input_text", text: reasoning }];
+      } else {
+        continue;
+      }
+    }
+    inputItems.push({ role, content: contentParts });
+  }
+
+  const instructions = instructionsParts
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join("\n");
+  return { instructions: instructions || null, input: inputItems };
+}
+
+function shouldRetryUpstream(status) {
+  return status === 400 || status === 422;
+}
+
+function responsesReqToPrompt(responsesReq) {
+  const parts = [];
+  if (typeof responsesReq.instructions === "string" && responsesReq.instructions.trim()) {
+    parts.push(responsesReq.instructions.trim());
+  }
+  if (Array.isArray(responsesReq.input)) {
+    for (const item of responsesReq.input) {
+      if (!item || typeof item !== "object") continue;
+      const role = item.role || "user";
+      const text = normalizeMessageContent(item.content);
+      if (text.trim()) parts.push(`${role}: ${text}`.trim());
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+function responsesReqVariants(responsesReq, stream) {
+  const variants = [];
+  const base = { ...responsesReq, stream: Boolean(stream) };
+  variants.push(base);
+
+  const maxOutput = base.max_output_tokens;
+  const instructions = base.instructions;
+  const input = base.input;
+  const containsImages = (() => {
+    if (!Array.isArray(input)) return false;
+    for (const item of input) {
+      const content = item?.content;
+      if (!Array.isArray(content)) continue;
+      for (const part of content) {
+        if (part && typeof part === "object" && part.type === "input_image") return true;
+      }
+    }
+    return false;
+  })();
+  const hasToolItems = (() => {
+    if (!Array.isArray(input)) return false;
+    for (const item of input) {
+      if (!item || typeof item !== "object") continue;
+      const t = item.type;
+      if (typeof t === "string" && (t === "function_call" || t === "function_call_output")) return true;
+    }
+    return false;
+  })();
+
+  if (Number.isInteger(maxOutput)) {
+    const v = { ...base };
+    delete v.max_output_tokens;
+    v.max_tokens = maxOutput;
+    variants.push(v);
+  }
+
+  if (typeof instructions === "string" && instructions.trim() && Array.isArray(input)) {
+    const v = { ...base };
+    delete v.instructions;
+    v.input = [{ role: "system", content: [{ type: "input_text", text: instructions }] }, ...input];
+    variants.push(v);
+    if (Number.isInteger(maxOutput)) {
+      const v2 = { ...v };
+      delete v2.max_output_tokens;
+      v2.max_tokens = maxOutput;
+      variants.push(v2);
+    }
+  }
+
+  if (Array.isArray(input) && !containsImages && !hasToolItems) {
+    const stringInput = input
+      .map((item) => {
+        if (!item || typeof item !== "object") return null;
+        const role = item.role || "user";
+        const txt = normalizeMessageContent(item.content);
+        if (!txt || !String(txt).trim()) return null;
+        return { role, content: txt };
+      })
+      .filter(Boolean);
+
+    const v = { ...base, input: stringInput };
+    variants.push(v);
+
+    if (typeof instructions === "string" && instructions.trim()) {
+      const v2 = { ...v };
+      delete v2.instructions;
+      v2.input = [{ role: "system", content: instructions }, ...stringInput];
+      variants.push(v2);
+    }
+  }
+
+  const prompt = responsesReqToPrompt(base);
+  if (prompt && !containsImages && !hasToolItems) {
+    const v = { ...base };
+    delete v.instructions;
+    v.input = [{ role: "user", content: [{ type: "input_text", text: prompt }] }];
+    variants.push(v);
+  }
+
+  // Some gateways expect `input_image.image_url` to be an object like `{ url }`.
+  // If we detect images, add compatibility variants that rewrite that field.
+  if (containsImages) {
+    const imageObjVariants = [];
+    for (const v of variants) {
+      if (!v || typeof v !== "object" || !Array.isArray(v.input)) continue;
+      let changed = false;
+      const newInput = v.input.map((item) => {
+        if (!item || typeof item !== "object" || !Array.isArray(item.content)) return item;
+        let contentChanged = false;
+        const newContent = item.content.map((part) => {
+          if (!part || typeof part !== "object" || part.type !== "input_image") return part;
+          const iu = part.image_url;
+          if (typeof iu === "string") {
+            contentChanged = true;
+            return { ...part, image_url: { url: iu } };
+          }
+          return part;
+        });
+        if (!contentChanged) return item;
+        changed = true;
+        return { ...item, content: newContent };
+      });
+      if (changed) imageObjVariants.push({ ...v, input: newInput });
+    }
+    variants.push(...imageObjVariants);
+  }
+
+  // Reasoning effort compatibility:
+  // - Some gateways accept `reasoning: { effort }`
+  // - Others accept `reasoning_effort: "<effort>"`
+  // - If a gateway rejects reasoning params, try a no-reasoning fallback.
+  const expanded = [];
+  for (const v of variants) {
+    expanded.push(v);
+    if (!v || typeof v !== "object") continue;
+    const objEffort =
+      v.reasoning && typeof v.reasoning === "object" && typeof v.reasoning.effort === "string" ? v.reasoning.effort.trim() : "";
+    const topEffort = typeof v.reasoning_effort === "string" ? v.reasoning_effort.trim() : "";
+    const effort = objEffort || topEffort;
+    if (!effort) continue;
+
+    const asTop = { ...v, reasoning_effort: effort };
+    delete asTop.reasoning;
+    expanded.push(asTop);
+
+    const asObj = { ...v, reasoning: { effort } };
+    delete asObj.reasoning_effort;
+    expanded.push(asObj);
+
+    const noReasoning = { ...v };
+    delete noReasoning.reasoning;
+    delete noReasoning.reasoning_effort;
+    expanded.push(noReasoning);
+  }
+  variants.length = 0;
+  variants.push(...expanded);
+
+  const seen = new Set();
+  const deduped = [];
+  for (const v of variants) {
+    const key = JSON.stringify(v);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(v);
+  }
+  return deduped;
+}
+
+function extractOutputTextFromResponsesResponse(response) {
+  if (!response || typeof response !== "object") return "";
+
+  const ot = response.output_text;
+  if (typeof ot === "string" && ot) return ot;
+  if (Array.isArray(ot)) {
+    const joined = ot.filter((x) => typeof x === "string").join("");
+    if (joined) return joined;
+  }
+
+  const parts = [];
+  const push = (v) => {
+    if (typeof v === "string" && v) parts.push(v);
+  };
+
+  const outputs = response.output;
+  if (Array.isArray(outputs)) {
+    for (const out of outputs) {
+      if (!out || typeof out !== "object") continue;
+      push(out.text);
+      push(out.output_text);
+      const content = out.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          if (!c || typeof c !== "object") continue;
+          push(c.text);
+          push(c.output_text);
+        }
+      }
+    }
+  }
+
+  const content = response.content;
+  if (Array.isArray(content)) {
+    for (const c of content) {
+      if (!c || typeof c !== "object") continue;
+      push(c.text);
+      push(c.output_text);
+    }
+  }
+
+  return parts.join("");
+}
+
+function extractToolCallsFromResponsesResponse(response) {
+  const out = [];
+  if (!response || typeof response !== "object") return out;
+
+  const seen = new Set();
+  const push = (callIdRaw, nameRaw, argsRaw) => {
+    const callId = typeof callIdRaw === "string" && callIdRaw.trim() ? callIdRaw.trim() : "";
+    if (!callId || seen.has(callId)) return;
+    const name = typeof nameRaw === "string" && nameRaw.trim() ? nameRaw.trim() : "";
+    const args = typeof argsRaw === "string" ? argsRaw : argsRaw == null ? "" : String(argsRaw);
+    out.push({ call_id: callId, name, arguments: args });
+    seen.add(callId);
+  };
+
+  const visit = (item) => {
+    if (!item || typeof item !== "object") return;
+
+    const t = item.type;
+    if (typeof t === "string" && t === "function_call") {
+      push(item.call_id ?? item.callId ?? item.id, item.name ?? item.function?.name, item.arguments ?? item.function?.arguments);
+      return;
+    }
+
+    const toolCalls = Array.isArray(item.tool_calls) ? item.tool_calls : null;
+    if (toolCalls) {
+      for (const tc of toolCalls) {
+        if (!tc || typeof tc !== "object") continue;
+        push(tc.id, tc.function?.name, tc.function?.arguments);
+      }
+    }
+  };
+
+  const outputs = response.output;
+  if (Array.isArray(outputs)) {
+    for (const item of outputs) visit(item);
+  }
+
+  return out;
+}
+
+function extractFromResponsesSseText(sseText) {
+  const text0 = typeof sseText === "string" ? sseText : "";
+  const lines = text0.split("\n");
+  let text = "";
+  let responseId = null;
+  let model = null;
+  let createdAt = null;
+  let sawDelta = false;
+  let sawAnyText = false;
+  const toolCalls = [];
+
+  for (const line of lines) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice(5).trim();
+    if (!data || data === "[DONE]") break;
+    let payload;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    const evt = payload?.type;
+
+    if (evt === "response.created" && payload?.response && typeof payload.response === "object") {
+      const rid = payload.response.id;
+      if (typeof rid === "string" && rid) responseId = rid;
+      const m = payload.response.model;
+      if (typeof m === "string" && m) model = m;
+      const c = payload.response.created_at;
+      if (Number.isInteger(c)) createdAt = c;
+      continue;
+    }
+
+    if (evt === "response.function_call_arguments.delta") {
+      const callId = payload.call_id ?? payload.callId ?? payload.id;
+      const name = payload.name;
+      const delta = payload.delta;
+      if (typeof callId === "string" && callId.trim()) {
+        toolCalls.push({
+          call_id: callId.trim(),
+          name: typeof name === "string" ? name : "",
+          arguments: typeof delta === "string" ? delta : "",
+        });
+      }
+      continue;
+    }
+
+    if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string") {
+      sawDelta = true;
+      sawAnyText = true;
+      text += payload.delta;
+      continue;
+    }
+    if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string") {
+      sawAnyText = true;
+      text += payload.text;
+      continue;
+    }
+    if (evt === "response.completed" && payload?.response && typeof payload.response === "object") {
+      const rid = payload.response.id;
+      if (!responseId && typeof rid === "string" && rid) responseId = rid;
+      if (!sawDelta && !sawAnyText) {
+        const t = extractOutputTextFromResponsesResponse(payload.response);
+        if (t) {
+          sawAnyText = true;
+          text += t;
+        }
+      }
+      const calls = extractToolCallsFromResponsesResponse(payload.response);
+      for (const c of calls) toolCalls.push(c);
+    }
+  }
+
+  return { text, responseId, model, createdAt, toolCalls };
+}
+
+async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = false, reqId = "") {
+  let lastStatus = 502;
+  let lastText = "";
+  let firstErr = null; // { status, text }
+  let exhaustedRetryable = false;
+  for (let i = 0; i < variants.length; i++) {
+    const body = JSON.stringify(variants[i]);
+    if (debug) {
+      logDebug(debug, reqId, "openai upstream fetch", {
+        url: upstreamUrl,
+        variant: i,
+        headers: redactHeadersForLog(headers),
+        bodyLen: body.length,
+        bodyPreview: previewString(body, 1200),
+      });
+    }
+    let resp;
+    try {
+      const t0 = Date.now();
+      resp = await fetch(upstreamUrl, {
+        method: "POST",
+        headers,
+        body,
+      });
+      if (debug) {
+        logDebug(debug, reqId, "openai upstream response", {
+          url: upstreamUrl,
+          variant: i,
+          status: resp.status,
+          ok: resp.ok,
+          contentType: resp.headers.get("content-type") || "",
+          elapsedMs: Date.now() - t0,
+        });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "fetch failed";
+      return { ok: false, status: 502, error: jsonError(`Upstream fetch failed: ${message}`, "bad_gateway"), upstreamUrl };
+    }
+    if (resp.status >= 400) {
+      lastStatus = resp.status;
+      lastText = await resp.text().catch(() => "");
+      if (!firstErr) firstErr = { status: resp.status, text: lastText };
+      if (shouldRetryUpstream(resp.status) && i + 1 < variants.length) continue;
+      exhaustedRetryable = shouldRetryUpstream(resp.status) && i + 1 >= variants.length;
+      try {
+        const errText = exhaustedRetryable && firstErr ? firstErr.text : lastText;
+        const errJson = JSON.parse(errText);
+        const errStatus = exhaustedRetryable && firstErr ? firstErr.status : resp.status;
+        return { ok: false, status: errStatus, error: errJson, upstreamUrl };
+      } catch {
+        const errStatus = exhaustedRetryable && firstErr ? firstErr.status : resp.status;
+        return { ok: false, status: errStatus, error: jsonError(`Upstream error: HTTP ${errStatus}`), upstreamUrl };
+      }
+    }
+    return { ok: true, resp, upstreamUrl };
+  }
+  if (exhaustedRetryable && firstErr) {
+    try {
+      return { ok: false, status: firstErr.status, error: JSON.parse(firstErr.text), upstreamUrl };
+    } catch {
+      return {
+        ok: false,
+        status: firstErr.status,
+        error: jsonError(firstErr.text || `Upstream error: HTTP ${firstErr.status}`),
+        upstreamUrl,
+      };
+    }
+  }
+  return { ok: false, status: lastStatus, error: jsonError(lastText || `Upstream error: HTTP ${lastStatus}`), upstreamUrl };
+}
+
+function shouldTryNextUpstreamUrl(status) {
+  // Gateways often return 403/404/405 for wrong paths; 502 for network/DNS.
+  // Some gateways also return 400/422 for unhandled routes.
+  return status === 400 || status === 422 || status === 403 || status === 404 || status === 405 || status === 500 || status === 502 || status === 503;
+}
+
+async function isProbablyEmptyEventStream(resp) {
+  try {
+    const ct = (resp?.headers?.get("content-type") || "").toLowerCase();
+    if (!ct.includes("text/event-stream")) return false;
+    if (!resp?.body) return true;
+
+    const clone = resp.clone();
+    const reader = clone.body.getReader();
+
+    const timeoutMs = 50;
+    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
+    const first = await Promise.race([reader.read(), timeout]);
+    try {
+      await reader.cancel();
+    } catch {}
+
+    // If it hasn't produced anything quickly, assume it's not empty (could just be slow model output).
+    if (!first) return false;
+
+    const { done, value } = first;
+    if (done) return true;
+    if (!value || value.length === 0) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function selectUpstreamResponseAny(upstreamUrls, headers, variants, debug = false, reqId = "") {
+  const urls = Array.isArray(upstreamUrls) ? upstreamUrls.filter(Boolean) : [];
+  if (!urls.length) {
+    return { ok: false, status: 500, error: jsonError("Server misconfigured: empty upstream URL list", "server_error") };
+  }
+
+  let firstErr = null;
+  for (const url of urls) {
+    if (debug) logDebug(debug, reqId, "openai upstream try", { url });
+    const sel = await selectUpstreamResponse(url, headers, variants, debug, reqId);
+    if (debug && !sel.ok) {
+      logDebug(debug, reqId, "openai upstream try failed", {
+        upstreamUrl: sel.upstreamUrl,
+        status: sel.status,
+        error: sel.error,
+      });
+    }
+    if (sel.ok && (await isProbablyEmptyEventStream(sel.resp))) {
+      if (!firstErr) {
+        firstErr = {
+          ok: false,
+          status: 502,
+          error: jsonError("Upstream returned an empty event stream", "bad_gateway"),
+          upstreamUrl: sel.upstreamUrl,
+        };
+      }
+      continue;
+    }
+    if (sel.ok) return sel;
+    if (!firstErr) firstErr = sel;
+    if (!shouldTryNextUpstreamUrl(sel.status)) return sel;
+  }
+  return firstErr || { ok: false, status: 502, error: jsonError("Upstream error", "bad_gateway") };
+}
+
+async function sessionCacheUrl(sessionKey) {
+  const hex = await sha256Hex(sessionKey);
+  return `https://session.rsp2com/${hex}`;
+}
+
+async function getSessionPreviousResponseId(sessionKey) {
+  try {
+    if (!sessionKey || typeof caches === "undefined" || !caches.default) return null;
+    const url = await sessionCacheUrl(sessionKey);
+    const resp = await caches.default.match(url);
+    if (!resp) return null;
+    const data = await resp.json().catch(() => null);
+    const rid = data?.previous_response_id;
+    return typeof rid === "string" && rid ? rid : null;
+  } catch {
+    return null;
+  }
+}
+
+async function setSessionPreviousResponseId(sessionKey, responseId) {
+  try {
+    if (!sessionKey || !responseId || typeof caches === "undefined" || !caches.default) return;
+    const url = await sessionCacheUrl(sessionKey);
+    const req = new Request(url, { method: "GET" });
+    const resp = new Response(JSON.stringify({ previous_response_id: responseId, updated_at: Date.now() }), {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "max-age=86400",
+      },
+    });
+    await caches.default.put(req, resp);
+  } catch {
+    // ignore
+  }
+}
+
+function hasAssistantMessage(messages) {
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (m && typeof m === "object" && m.role === "assistant") return true;
+  }
+  return false;
+}
+
+function indexOfLastAssistantMessage(messages) {
+  const msgs = Array.isArray(messages) ? messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m && typeof m === "object" && m.role === "assistant") return i;
+  }
+  return -1;
+}
+
+function lastUserMessageParts(messages) {
+  const msgs = Array.isArray(messages) ? messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m || typeof m !== "object") continue;
+    if (m.role !== "user") continue;
+    const parts = messageContentToResponsesParts(m.content);
+    if (parts.length) return parts;
+    const reasoning = m.reasoning_content;
+    if (typeof reasoning === "string" && reasoning.trim()) return [{ type: "input_text", text: reasoning }];
+  }
+  return [];
+}
+
+function normalizeReasoningEffort(raw) {
+  if (typeof raw !== "string") return "";
+  const v0 = raw.trim();
+  if (!v0) return "";
+  const v = v0.toLowerCase();
+  if (v === "off" || v === "no" || v === "false" || v === "0" || v === "disable" || v === "disabled") return "";
+  return v;
+}
+
+function getReasoningEffort(reqJson, env) {
+  const body = reqJson && typeof reqJson === "object" ? reqJson : null;
+  const hasReq =
+    Boolean(body && ("reasoning_effort" in body || "reasoningEffort" in body)) ||
+    Boolean(body && body.reasoning && typeof body.reasoning === "object" && "effort" in body.reasoning);
+
+  const fromReq =
+    body?.reasoning_effort ?? body?.reasoningEffort ?? (body?.reasoning && typeof body.reasoning === "object" ? body.reasoning.effort : undefined);
+  const reqEffort = normalizeReasoningEffort(String(fromReq ?? ""));
+  if (reqEffort) return reqEffort;
+  if (hasReq) return "";
+
+  const envRaw = typeof env?.RESP_REASONING_EFFORT === "string" ? env.RESP_REASONING_EFFORT : "";
+  const envEffort = normalizeReasoningEffort(envRaw);
+  if (envEffort) return envEffort;
+  if (envRaw && envRaw.trim()) return "";
+
+  // Default: low (best-effort). If you want to send no reasoning params, set RESP_REASONING_EFFORT=off.
+  return "low";
+}
+
+export async function handleOpenAIRequest({
+  request,
+  env,
+  reqJson,
+  model,
+  stream,
+  token,
+  debug,
+  reqId,
+  path,
+  startedAt,
+  isTextCompletions,
+  extraSystemText,
+}) {
+  const upstreamBase = normalizeAuthValue(env.OPENAI_BASE_URL);
+  if (!upstreamBase) return jsonResponse(500, jsonError("Server misconfigured: missing OPENAI_BASE_URL", "server_error"));
+  const upstreamKey = normalizeAuthValue(env.OPENAI_API_KEY);
+  if (!upstreamKey) return jsonResponse(500, jsonError("Server misconfigured: missing OPENAI_API_KEY", "server_error"));
+
+  const upstreamUrls = buildUpstreamUrls(upstreamBase, env.RESP_RESPONSES_PATH);
+  if (debug) logDebug(debug, reqId, "openai upstream urls", { urls: upstreamUrls });
+  // Some gateways (including Codex SDK style proxies) require upstream `stream: true`.
+  // We can still serve non-stream clients by buffering the SSE output into a single JSON response.
+  const upstreamStream = true;
+
+  const headers = {
+    "content-type": "application/json",
+    accept: upstreamStream ? "text/event-stream" : "application/json",
+    authorization: `Bearer ${upstreamKey}`,
+    "x-api-key": upstreamKey,
+    "x-goog-api-key": upstreamKey,
+    "openai-beta": "responses=v1",
+  };
+  if (debug) logDebug(debug, reqId, "openai upstream headers", { headers: redactHeadersForLog(headers) });
+
+  const reasoningEffort = getReasoningEffort(reqJson, env);
+  if (isTextCompletions) {
+    const prompt = reqJson.prompt;
+    const promptText = Array.isArray(prompt) ? (typeof prompt[0] === "string" ? prompt[0] : "") : typeof prompt === "string" ? prompt : String(prompt ?? "");
+    const responsesReq = {
+      model,
+      input: [{ role: "user", content: [{ type: "input_text", text: promptText }] }],
+    };
+    if (reasoningEffort) responsesReq.reasoning = { effort: reasoningEffort };
+    if (Number.isInteger(reqJson.max_tokens)) responsesReq.max_output_tokens = reqJson.max_tokens;
+    if (Number.isInteger(reqJson.max_completion_tokens)) responsesReq.max_output_tokens = reqJson.max_completion_tokens;
+    applyTemperatureTopPFromRequest(reqJson, responsesReq);
+    if ("stop" in reqJson) responsesReq.stop = reqJson.stop;
+
+    const variants = responsesReqVariants(responsesReq, upstreamStream);
+    if (debug) {
+      const reqLog = safeJsonStringifyForLog(responsesReq);
+      logDebug(debug, reqId, "openai completions request", {
+        variants: variants.length,
+        requestLen: reqLog.length,
+        requestPreview: previewString(reqLog, 2400),
+      });
+    }
+    const sel = await selectUpstreamResponseAny(upstreamUrls, headers, variants, debug, reqId);
+    if (!sel.ok && debug) {
+      logDebug(debug, reqId, "openai upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
+    }
+    if (!sel.ok) return jsonResponse(sel.status, sel.error);
+    if (debug) {
+      logDebug(debug, reqId, "openai upstream selected", {
+        path,
+        upstreamUrl: sel.upstreamUrl,
+        status: sel.resp.status,
+        contentType: sel.resp.headers.get("content-type") || "",
+      });
+    }
+
+    if (!stream) {
+      let fullText = "";
+      let sawDelta = false;
+      let sawAnyText = false;
+      let sawDataLine = false;
+      let raw = "";
+      const reader = sel.resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let finished = false;
+      while (!finished) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunkText = decoder.decode(value, { stream: true });
+        raw += chunkText;
+        buf += chunkText;
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          sawDataLine = true;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") {
+            finished = true;
+            break;
+          }
+          let payload;
+          try {
+            payload = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          const evt = payload?.type;
+          if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string") {
+            sawDelta = true;
+            sawAnyText = true;
+            fullText += payload.delta;
+            continue;
+          }
+          if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string") {
+            sawAnyText = true;
+            fullText += payload.text;
+            continue;
+          }
+          if (!sawDelta && !sawAnyText && evt === "response.completed" && payload?.response && typeof payload.response === "object") {
+            const t = extractOutputTextFromResponsesResponse(payload.response);
+            if (t) {
+              sawAnyText = true;
+              fullText += t;
+            }
+            finished = true;
+            break;
+          }
+          if (evt === "response.completed" || evt === "response.failed") {
+            finished = true;
+            break;
+          }
+        }
+      }
+      try {
+        await reader.cancel();
+      } catch {}
+      if (!sawDataLine && raw.trim()) {
+        try {
+          const obj = JSON.parse(raw);
+          if (typeof obj === "string") {
+            const ex = extractFromResponsesSseText(obj);
+            if (ex.text) fullText = ex.text;
+          } else {
+            const responseObj = obj?.response && typeof obj.response === "object" ? obj.response : obj;
+            fullText = extractOutputTextFromResponsesResponse(responseObj) || fullText;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (debug && !sawDataLine) {
+        logDebug(debug, reqId, "openai upstream non-sse sample", { rawPreview: previewString(raw, 1200) });
+      }
+      if (debug) {
+        logDebug(debug, reqId, "openai completions parsed", {
+          textLen: fullText.length,
+          textPreview: previewString(fullText, 800),
+          sawDataLine,
+          sawDelta,
+          sawAnyText,
+          rawLen: raw.length,
+        });
+      }
+      const created = Math.floor(Date.now() / 1000);
+      return jsonResponse(200, {
+        id: `cmpl_${crypto.randomUUID().replace(/-/g, "")}`,
+        object: "text_completion",
+        created,
+        model,
+        choices: [{ text: fullText, index: 0, logprobs: null, finish_reason: "stop" }],
+      });
+    }
+
+    // stream=true for /v1/completions
+    const completionId = `cmpl_${crypto.randomUUID().replace(/-/g, "")}`;
+    const created = Math.floor(Date.now() / 1000);
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    (async () => {
+      const streamStartedAt = Date.now();
+      let sentFinal = false;
+      let sawDelta = false;
+      let sentAnyText = false;
+      let sawDataLine = false;
+      let raw = "";
+      try {
+        const reader = sel.resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        let finished = false;
+        while (!finished) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunkText = decoder.decode(value, { stream: true });
+          raw += chunkText;
+          buf += chunkText;
+          const lines = buf.split("\n");
+          buf = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            sawDataLine = true;
+            const data = line.slice(5).trim();
+            if (data === "[DONE]") {
+              finished = true;
+              break;
+            }
+            let payload;
+            try {
+              payload = JSON.parse(data);
+            } catch {
+              continue;
+            }
+            const evt = payload?.type;
+            if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string" && payload.delta) {
+              sawDelta = true;
+              sentAnyText = true;
+              const chunk = {
+                id: completionId,
+                object: "text_completion",
+                created,
+                model,
+                choices: [{ text: payload.delta, index: 0, logprobs: null, finish_reason: null }],
+              };
+              await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+              continue;
+            }
+            if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string" && payload.text) {
+              sentAnyText = true;
+              const chunk = {
+                id: completionId,
+                object: "text_completion",
+                created,
+                model,
+                choices: [{ text: payload.text, index: 0, logprobs: null, finish_reason: null }],
+              };
+              await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+              continue;
+            }
+            if (!sawDelta && !sentAnyText && evt === "response.completed" && payload?.response && typeof payload.response === "object") {
+              const t = extractOutputTextFromResponsesResponse(payload.response);
+              if (t) {
+                sentAnyText = true;
+                const chunk = {
+                  id: completionId,
+                  object: "text_completion",
+                  created,
+                  model,
+                  choices: [{ text: t, index: 0, logprobs: null, finish_reason: null }],
+                };
+                await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+              }
+              finished = true;
+              break;
+            }
+            if (evt === "response.completed" || evt === "response.failed") {
+              finished = true;
+              break;
+            }
+          }
+        }
+        try {
+          await reader.cancel();
+        } catch {}
+      } catch (err) {
+        if (debug) {
+          const message = err instanceof Error ? err.message : String(err ?? "stream error");
+          logDebug(debug, reqId, "openai completions stream error", { error: message });
+        }
+      } finally {
+        if (!sawDataLine && !sentAnyText && raw.trim()) {
+          if (debug) logDebug(debug, reqId, "openai upstream non-sse sample", { rawPreview: previewString(raw, 1200) });
+          try {
+            const obj = JSON.parse(raw);
+            if (typeof obj === "string") {
+              const ex = extractFromResponsesSseText(obj);
+              const t = ex.text;
+              if (t) {
+                sentAnyText = true;
+                const chunk = {
+                  id: completionId,
+                  object: "text_completion",
+                  created,
+                  model,
+                  choices: [{ text: t, index: 0, logprobs: null, finish_reason: null }],
+                };
+                await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+              }
+            } else {
+              const responseObj = obj?.response && typeof obj.response === "object" ? obj.response : obj;
+              const t = extractOutputTextFromResponsesResponse(responseObj);
+              if (t) {
+                sentAnyText = true;
+                const chunk = {
+                  id: completionId,
+                  object: "text_completion",
+                  created,
+                  model,
+                  choices: [{ text: t, index: 0, logprobs: null, finish_reason: null }],
+                };
+                await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+        if (!sentFinal) {
+          const finalChunk = {
+            id: completionId,
+            object: "text_completion",
+            created,
+            model,
+            choices: [{ text: "", index: 0, logprobs: null, finish_reason: "stop" }],
+          };
+          try {
+            await writer.write(encoder.encode(encodeSseData(JSON.stringify(finalChunk))));
+            await writer.write(encoder.encode(encodeSseData("[DONE]")));
+          } catch {}
+        }
+        try {
+          await writer.close();
+        } catch {}
+        if (debug) {
+          logDebug(debug, reqId, "openai completions stream summary", {
+            completionId,
+            elapsedMs: Date.now() - streamStartedAt,
+            sentAnyText,
+            sawDelta,
+            sawDataLine,
+            rawLen: raw.length,
+          });
+        }
+      }
+    })();
+
+    return new Response(readable, { status: 200, headers: sseHeaders() });
+  }
+
+  // /v1/chat/completions
+  const messages = reqJson.messages;
+  if (!Array.isArray(messages)) return jsonResponse(400, jsonError("Missing required field: messages"));
+
+  const sessionKey = getSessionKey(request, reqJson, token);
+  if (debug) logDebug(debug, reqId, "openai session", { sessionKey: sessionKey ? maskSecret(sessionKey) : "", multiTurnPossible: hasAssistantMessage(messages) });
+
+  const { instructions, input } = chatMessagesToResponsesInput(messages);
+  if (!input.length) return jsonResponse(400, jsonError("messages must include at least one non-system message"));
+
+  const effectiveInstructions = appendInstructions(instructions, extraSystemText);
+
+  const fullReq = {
+    model,
+    input,
+  };
+  if (reasoningEffort) fullReq.reasoning = { effort: reasoningEffort };
+  if (effectiveInstructions) fullReq.instructions = effectiveInstructions;
+  applyTemperatureTopPFromRequest(reqJson, fullReq);
+  if ("stop" in reqJson) fullReq.stop = reqJson.stop;
+
+  const respTools = openaiToolsToResponsesTools(reqJson.tools);
+  if (respTools.length) fullReq.tools = respTools;
+  const respToolChoice = openaiToolChoiceToResponsesToolChoice(reqJson.tool_choice);
+  if (respToolChoice !== undefined) fullReq.tool_choice = respToolChoice;
+
+  const maxTokens = Number.isInteger(reqJson.max_tokens)
+    ? reqJson.max_tokens
+    : Number.isInteger(reqJson.max_completion_tokens)
+      ? reqJson.max_completion_tokens
+      : null;
+  if (Number.isInteger(maxTokens)) fullReq.max_output_tokens = maxTokens;
+
+  const lastAssistantIdx = indexOfLastAssistantMessage(messages);
+  const multiTurn = lastAssistantIdx >= 0;
+  const prevId = multiTurn ? await getSessionPreviousResponseId(sessionKey) : null;
+  const deltaMessages = prevId && lastAssistantIdx >= 0 ? messages.slice(lastAssistantIdx + 1) : [];
+  const deltaConv = deltaMessages.length ? chatMessagesToResponsesInput(deltaMessages) : { input: [] };
+
+  const prevReq =
+    prevId && Array.isArray(deltaConv.input) && deltaConv.input.length
+      ? {
+          model,
+          input: deltaConv.input,
+          previous_response_id: prevId,
+        }
+      : null;
+  if (prevReq) {
+    if (reasoningEffort) prevReq.reasoning = { effort: reasoningEffort };
+    if (effectiveInstructions) prevReq.instructions = effectiveInstructions;
+    applyTemperatureTopPFromRequest(reqJson, prevReq);
+    if ("stop" in reqJson) prevReq.stop = reqJson.stop;
+
+    const respTools = openaiToolsToResponsesTools(reqJson.tools);
+    if (respTools.length) prevReq.tools = respTools;
+    const respToolChoice = openaiToolChoiceToResponsesToolChoice(reqJson.tool_choice);
+    if (respToolChoice !== undefined) prevReq.tool_choice = respToolChoice;
+    if (Number.isInteger(maxTokens)) prevReq.max_output_tokens = maxTokens;
+  }
+
+  const primaryReq = prevReq || fullReq;
+  const primaryVariants = responsesReqVariants(primaryReq, upstreamStream);
+  if (debug) {
+    const reqLog = safeJsonStringifyForLog(primaryReq);
+    logDebug(debug, reqId, "openai chat request", {
+      usingPreviousResponseId: Boolean(prevReq?.previous_response_id),
+      previous_response_id: prevReq?.previous_response_id ? maskSecret(prevReq.previous_response_id) : "",
+      deltaMessagesCount: deltaMessages.length,
+      totalMessagesCount: messages.length,
+      inputItems: Array.isArray(primaryReq?.input) ? primaryReq.input.length : 0,
+      hasInstructions: Boolean(primaryReq?.instructions),
+      instructionsLen: typeof primaryReq?.instructions === "string" ? primaryReq.instructions.length : 0,
+      toolsCount: Array.isArray(primaryReq?.tools) ? primaryReq.tools.length : 0,
+      toolChoice: primaryReq?.tool_choice ?? null,
+      max_output_tokens: primaryReq?.max_output_tokens ?? null,
+      variants: primaryVariants.length,
+      requestLen: reqLog.length,
+      requestPreview: previewString(reqLog, 2400),
+    });
+  }
+  let sel = await selectUpstreamResponseAny(upstreamUrls, headers, primaryVariants, debug, reqId);
+
+  // If the upstream doesn't accept `previous_response_id`, fall back to full history.
+  if (!sel.ok && prevReq) {
+    const fallbackVariants = responsesReqVariants(fullReq, upstreamStream);
+    const sel2 = await selectUpstreamResponseAny(upstreamUrls, headers, fallbackVariants, debug, reqId);
+    if (sel2.ok) sel = sel2;
+  }
+  if (!sel.ok && debug) {
+    logDebug(debug, reqId, "openai upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
+  }
+  if (!sel.ok) return jsonResponse(sel.status, sel.error);
+  if (debug) {
+    logDebug(debug, reqId, "openai upstream selected", {
+      path,
+      upstreamUrl: sel.upstreamUrl,
+      status: sel.resp.status,
+      contentType: sel.resp.headers.get("content-type") || "",
+    });
+  }
+
+  if (!stream) {
+    let fullText = "";
+    let responseId = null;
+    let sawDelta = false;
+    let sawAnyText = false;
+    let sawToolCall = false;
+    let sawDataLine = false;
+    let raw = "";
+    const toolCallsById = new Map(); // call_id -> { name, args }
+    const upsertToolCall = (callIdRaw, nameRaw, argsRaw, mode) => {
+      const callId = typeof callIdRaw === "string" ? callIdRaw.trim() : "";
+      if (!callId) return;
+      sawToolCall = true;
+      const buf = toolCallsById.get(callId) || { name: "", args: "" };
+      if (typeof nameRaw === "string" && nameRaw.trim()) buf.name = nameRaw.trim();
+      if (typeof argsRaw === "string" && argsRaw) {
+        if (mode === "delta") {
+          buf.args += argsRaw;
+        } else {
+          const full = argsRaw;
+          if (!buf.args) buf.args = full;
+          else if (full.startsWith(buf.args)) buf.args = full;
+          else buf.args = full;
+        }
+      }
+      toolCallsById.set(callId, buf);
+    };
+    const reader = sel.resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let finished = false;
+    while (!finished) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunkText = decoder.decode(value, { stream: true });
+      raw += chunkText;
+      buf += chunkText;
+      const lines = buf.split("\n");
+      buf = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        sawDataLine = true;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") {
+          finished = true;
+          break;
+        }
+        let payload;
+        try {
+          payload = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        const evt = payload?.type;
+        if (evt === "response.created" && payload?.response && typeof payload.response === "object") {
+          const rid = payload.response.id;
+          if (typeof rid === "string" && rid) responseId = rid;
+          continue;
+        }
+        if (evt === "response.function_call_arguments.delta") {
+          upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.delta, "delta");
+          continue;
+        }
+        if (evt === "response.function_call_arguments.done" || evt === "response.function_call.done") {
+          upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.arguments, "full");
+          continue;
+        }
+        if ((evt === "response.output_item.added" || evt === "response.output_item.done") && payload?.item && typeof payload.item === "object") {
+          const item = payload.item;
+          if (item?.type === "function_call") {
+            upsertToolCall(item.call_id ?? item.callId ?? item.id, item.name ?? item.function?.name, item.arguments ?? item.function?.arguments, "full");
+          }
+          continue;
+        }
+        if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string") {
+          sawDelta = true;
+          sawAnyText = true;
+          fullText += payload.delta;
+          continue;
+        }
+        if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string") {
+          sawAnyText = true;
+          fullText += payload.text;
+          continue;
+        }
+        if (evt === "response.completed" && payload?.response && typeof payload.response === "object") {
+          const rid = payload.response.id;
+          if (!responseId && typeof rid === "string" && rid) responseId = rid;
+          if (!sawDelta && !sawAnyText) {
+            const t = extractOutputTextFromResponsesResponse(payload.response);
+            if (t) {
+              sawAnyText = true;
+              fullText += t;
+            }
+          }
+          const calls = extractToolCallsFromResponsesResponse(payload.response);
+          for (const c of calls) upsertToolCall(c.call_id, c.name, c.arguments, "full");
+          finished = true;
+          break;
+        }
+        if (evt === "response.failed") {
+          finished = true;
+          break;
+        }
+      }
+    }
+    try {
+      await reader.cancel();
+    } catch {}
+    if (!sawDataLine && raw.trim()) {
+      try {
+        const obj = JSON.parse(raw);
+        if (typeof obj === "string") {
+          const ex = extractFromResponsesSseText(obj);
+          if (!responseId && ex.responseId) responseId = ex.responseId;
+          if (!sawAnyText && ex.text) fullText = ex.text;
+          if (Array.isArray(ex.toolCalls)) {
+            for (const c of ex.toolCalls) upsertToolCall(c.call_id, c.name, c.arguments, "delta");
+          }
+        } else {
+          const responseObj = obj?.response && typeof obj.response === "object" ? obj.response : obj;
+          const rid = responseObj?.id;
+          if (!responseId && typeof rid === "string" && rid) responseId = rid;
+          if (!sawAnyText) fullText = extractOutputTextFromResponsesResponse(responseObj) || fullText;
+          const calls = extractToolCallsFromResponsesResponse(responseObj);
+          for (const c of calls) upsertToolCall(c.call_id, c.name, c.arguments, "full");
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (debug && !sawDataLine) {
+      logDebug(debug, reqId, "openai upstream non-sse sample", { rawPreview: previewString(raw, 1200) });
+    }
+    const created = Math.floor(Date.now() / 1000);
+    if (responseId) {
+      await setSessionPreviousResponseId(sessionKey, responseId);
+      if (debug) logDebug(debug, reqId, "openai session cache set", { previous_response_id: maskSecret(responseId) });
+    }
+    const outId = responseId ? `chatcmpl_${responseId}` : `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
+    const toolCalls = Array.from(toolCallsById.entries()).map(([id, v]) => ({
+      id,
+      type: "function",
+      function: { name: v.name || "unknown_tool", arguments: v.args && v.args.trim() ? v.args : "{}" },
+    }));
+    const finishReason = toolCalls.length ? "tool_calls" : "stop";
+    const contentValue = fullText && fullText.length ? fullText : toolCalls.length ? null : "";
+    if (debug) {
+      logDebug(debug, reqId, "openai chat parsed", {
+        responseId: responseId ? maskSecret(responseId) : "",
+        outId,
+        finish_reason: finishReason,
+        textLen: fullText.length,
+        textPreview: previewString(fullText, 800),
+        toolCalls: toolCalls.map((c) => ({
+          id: c.id,
+          name: c.function?.name || "",
+          argsLen: c.function?.arguments?.length || 0,
+        })),
+        sawDataLine,
+        sawDelta,
+        sawAnyText,
+        rawLen: raw.length,
+      });
+    }
+    return jsonResponse(200, {
+      id: outId,
+      object: "chat.completion",
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: contentValue, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
+          finish_reason: finishReason,
+        },
+      ],
+    });
+  }
+
+  // stream=true
+  let chatId = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
+  let created = Math.floor(Date.now() / 1000);
+  let outModel = model;
+  let responseId = null;
+  let sawDelta = false;
+  let sentAnyText = false;
+  let sawToolCall = false;
+  let sawDataLine = false;
+  let raw = "";
+  let sentRole = false;
+  let sentFinal = false;
+  const toolCallIdToIndex = new Map(); // call_id -> index
+  let nextToolCallIndex = 0;
+  const toolCallsById = new Map(); // call_id -> { name, args }
+
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  (async () => {
+    const streamStartedAt = Date.now();
+    const getToolCallIndex = (callId) => {
+      const id = typeof callId === "string" ? callId.trim() : "";
+      if (!id) return 0;
+      if (!toolCallIdToIndex.has(id)) toolCallIdToIndex.set(id, nextToolCallIndex++);
+      return toolCallIdToIndex.get(id) || 0;
+    };
+
+    const ensureAssistantRoleSent = async () => {
+      if (sentRole) return;
+      const roleChunk = {
+        id: chatId,
+        object: "chat.completion.chunk",
+        created,
+        model: outModel,
+        choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+      };
+      await writer.write(encoder.encode(encodeSseData(JSON.stringify(roleChunk))));
+      sentRole = true;
+    };
+
+    const emitToolCallDelta = async (callId, name, argsDelta) => {
+      const id = typeof callId === "string" ? callId.trim() : "";
+      if (!id) return;
+      const fn = {};
+      if (typeof name === "string" && name.trim()) fn.name = name.trim();
+      if (typeof argsDelta === "string" && argsDelta) fn.arguments = argsDelta;
+      if (!("name" in fn) && !("arguments" in fn)) return;
+
+      sawToolCall = true;
+      await ensureAssistantRoleSent();
+      const idx = getToolCallIndex(id);
+      const chunk = {
+        id: chatId,
+        object: "chat.completion.chunk",
+        created,
+        model: outModel,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: idx,
+                  id,
+                  type: "function",
+                  function: fn,
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      };
+      await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+    };
+
+    const upsertToolCall = async (callIdRaw, nameRaw, argsRaw, mode) => {
+      const callId = typeof callIdRaw === "string" ? callIdRaw.trim() : "";
+      if (!callId) return;
+
+      const buf0 = toolCallsById.get(callId) || { name: "", args: "" };
+      const name = typeof nameRaw === "string" && nameRaw.trim() ? nameRaw.trim() : buf0.name;
+      let delta = "";
+
+      if (typeof argsRaw === "string" && argsRaw) {
+        if (mode === "delta") {
+          delta = argsRaw;
+          buf0.args += argsRaw;
+        } else {
+          const full = argsRaw;
+          delta = buf0.args && full.startsWith(buf0.args) ? full.slice(buf0.args.length) : full;
+          buf0.args = full;
+        }
+      }
+
+      buf0.name = name;
+      toolCallsById.set(callId, buf0);
+      await emitToolCallDelta(callId, name, delta);
+    };
+
+    try {
+      const reader = sel.resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let finished = false;
+      while (!finished) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunkText = decoder.decode(value, { stream: true });
+        raw += chunkText;
+        buf += chunkText;
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          sawDataLine = true;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") {
+            finished = true;
+            break;
+          }
+          let payload;
+          try {
+            payload = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          const evt = payload?.type;
+
+          if (evt === "response.created" && payload?.response && typeof payload.response === "object") {
+            const rid = payload.response.id;
+            if (typeof rid === "string" && rid) {
+              responseId = rid;
+              chatId = `chatcmpl_${rid}`;
+            }
+            const m = payload.response.model;
+            if (typeof m === "string" && m) outModel = m;
+            const c = payload.response.created_at;
+            if (Number.isInteger(c)) created = c;
+            continue;
+          }
+
+          if (evt === "response.function_call_arguments.delta") {
+            await upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.delta, "delta");
+            continue;
+          }
+
+          if (evt === "response.function_call_arguments.done" || evt === "response.function_call.done") {
+            await upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.arguments, "full");
+            continue;
+          }
+
+          if ((evt === "response.output_item.added" || evt === "response.output_item.done") && payload?.item && typeof payload.item === "object") {
+            const item = payload.item;
+            if (item?.type === "function_call") {
+              await upsertToolCall(item.call_id ?? item.callId ?? item.id, item.name ?? item.function?.name, item.arguments ?? item.function?.arguments, "full");
+            }
+            continue;
+          }
+
+          if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string" && payload.delta) {
+            sawDelta = true;
+            sentAnyText = true;
+            await ensureAssistantRoleSent();
+            const chunk = {
+              id: chatId,
+              object: "chat.completion.chunk",
+              created,
+              model: outModel,
+              choices: [{ index: 0, delta: { content: payload.delta }, finish_reason: null }],
+            };
+            await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+            continue;
+          }
+
+          if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string" && payload.text) {
+            sentAnyText = true;
+            await ensureAssistantRoleSent();
+            const chunk = {
+              id: chatId,
+              object: "chat.completion.chunk",
+              created,
+              model: outModel,
+              choices: [{ index: 0, delta: { content: payload.text }, finish_reason: null }],
+            };
+            await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+            continue;
+          }
+
+          if (evt === "response.completed" || evt === "response.failed") {
+            if (evt === "response.completed" && payload?.response && typeof payload.response === "object") {
+              const rid = payload.response.id;
+              if (!responseId && typeof rid === "string" && rid) responseId = rid;
+
+              const calls = extractToolCallsFromResponsesResponse(payload.response);
+              for (const c of calls) await upsertToolCall(c.call_id, c.name, c.arguments, "full");
+
+              if (!sawDelta && !sentAnyText) {
+                const t = extractOutputTextFromResponsesResponse(payload.response);
+                if (t) {
+                  sentAnyText = true;
+                  await ensureAssistantRoleSent();
+                  const chunk = {
+                    id: chatId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: outModel,
+                    choices: [{ index: 0, delta: { content: t }, finish_reason: null }],
+                  };
+                  await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+                }
+              }
+            }
+            if (!sentFinal) {
+              const finishReason = toolCallsById.size ? "tool_calls" : "stop";
+              const finalChunk = {
+                id: chatId,
+                object: "chat.completion.chunk",
+                created,
+                model: outModel,
+                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+              };
+              await writer.write(encoder.encode(encodeSseData(JSON.stringify(finalChunk))));
+              sentFinal = true;
+            }
+            finished = true;
+            break;
+          }
+        }
+      }
+      try {
+        await reader.cancel();
+      } catch {}
+    } catch (err) {
+      if (debug) {
+        const message = err instanceof Error ? err.message : String(err ?? "stream error");
+        logDebug(debug, reqId, "openai stream translate error", { error: message });
+      }
+    } finally {
+      if (!sawDataLine && raw.trim()) {
+        if (debug) logDebug(debug, reqId, "openai upstream non-sse sample", { rawPreview: previewString(raw, 1200) });
+        try {
+          const obj = JSON.parse(raw);
+          if (typeof obj === "string") {
+            const ex = extractFromResponsesSseText(obj);
+            if (!responseId && ex.responseId) {
+              responseId = ex.responseId;
+              chatId = `chatcmpl_${ex.responseId}`;
+            }
+            if (typeof ex.model === "string" && ex.model) outModel = ex.model;
+            if (Number.isInteger(ex.createdAt)) created = ex.createdAt;
+            if (Array.isArray(ex.toolCalls)) {
+              for (const c of ex.toolCalls) await upsertToolCall(c.call_id, c.name, c.arguments, "delta");
+            }
+            if (!sentAnyText && ex.text) {
+              sentAnyText = true;
+              await ensureAssistantRoleSent();
+              const chunk = {
+                id: chatId,
+                object: "chat.completion.chunk",
+                created,
+                model: outModel,
+                choices: [{ index: 0, delta: { content: ex.text }, finish_reason: null }],
+              };
+              await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+            }
+          } else {
+            const responseObj = obj?.response && typeof obj.response === "object" ? obj.response : obj;
+            const rid = responseObj?.id;
+            if (!responseId && typeof rid === "string" && rid) {
+              responseId = rid;
+              chatId = `chatcmpl_${rid}`;
+            }
+            const m = responseObj?.model;
+            if (typeof m === "string" && m) outModel = m;
+            const c = responseObj?.created_at;
+            if (Number.isInteger(c)) created = c;
+
+            const calls = extractToolCallsFromResponsesResponse(responseObj);
+            for (const tc of calls) await upsertToolCall(tc.call_id, tc.name, tc.arguments, "full");
+
+            if (!sentAnyText) {
+              const t = extractOutputTextFromResponsesResponse(responseObj);
+              if (t) {
+                sentAnyText = true;
+                await ensureAssistantRoleSent();
+                const chunk = {
+                  id: chatId,
+                  object: "chat.completion.chunk",
+                  created,
+                  model: outModel,
+                  choices: [{ index: 0, delta: { content: t }, finish_reason: null }],
+                };
+                await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+              }
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (!sentFinal) {
+        try {
+          const finishReason = toolCallsById.size ? "tool_calls" : "stop";
+          const finalChunk = {
+            id: chatId,
+            object: "chat.completion.chunk",
+            created,
+            model: outModel,
+            choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          };
+          await writer.write(encoder.encode(encodeSseData(JSON.stringify(finalChunk))));
+        } catch {}
+      }
+      try {
+        await writer.write(encoder.encode(encodeSseData("[DONE]")));
+      } catch {}
+      try {
+        await writer.close();
+      } catch {}
+      if (responseId) await setSessionPreviousResponseId(sessionKey, responseId);
+      if (debug) {
+        const finishReason = toolCallsById.size ? "tool_calls" : "stop";
+        logDebug(debug, reqId, "openai stream summary", {
+          elapsedMs: Date.now() - streamStartedAt,
+          responseId: responseId ? maskSecret(responseId) : "",
+          outModel,
+          sentAnyText,
+          sawToolCall,
+          sawDataLine,
+          rawLen: raw.length,
+          finish_reason: finishReason,
+          toolCallsCount: toolCallsById.size,
+          toolCalls: Array.from(toolCallsById.entries()).map(([id, v]) => ({
+            id,
+            name: v?.name || "",
+            argsLen: typeof v?.args === "string" ? v.args.length : 0,
+          })),
+        });
+      }
+    }
+  })();
+
+  if (debug) logDebug(debug, reqId, "request done", { elapsedMs: Date.now() - startedAt });
+  return new Response(readable, { status: 200, headers: sseHeaders() });
+}
+
