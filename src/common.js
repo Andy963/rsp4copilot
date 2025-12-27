@@ -23,6 +23,179 @@ export function parseBoolEnv(value) {
   return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on";
 }
 
+export const DEFAULT_RSP4COPILOT_MAX_TURNS = 12;
+export const DEFAULT_RSP4COPILOT_MAX_MESSAGES = 40;
+export const DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS = 300000;
+
+function parseIntEnv(raw, fallback) {
+  if (typeof raw !== "string") return fallback;
+  const s = raw.trim();
+  if (!s) return fallback;
+  const n = parseInt(s, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return n;
+}
+
+export function getRsp4CopilotLimits(env) {
+  return {
+    maxTurns: parseIntEnv(env?.RSP4COPILOT_MAX_TURNS, DEFAULT_RSP4COPILOT_MAX_TURNS),
+    maxMessages: parseIntEnv(env?.RSP4COPILOT_MAX_MESSAGES, DEFAULT_RSP4COPILOT_MAX_MESSAGES),
+    maxInputChars: parseIntEnv(env?.RSP4COPILOT_MAX_INPUT_CHARS, DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS),
+  };
+}
+
+function estimateJsonChars(value) {
+  try {
+    return JSON.stringify(value).length;
+  } catch {
+    return String(value ?? "").length;
+  }
+}
+
+export function measureOpenAIChatMessages(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  let turns = 0;
+  let inputChars = 0;
+  for (const m of list) {
+    if (m && typeof m === "object") {
+      const r = typeof m.role === "string" ? m.role.trim().toLowerCase() : "";
+      if (r === "user") turns++;
+    }
+    inputChars += estimateJsonChars(m);
+  }
+  return { turns, messages: list.length, inputChars };
+}
+
+export function trimOpenAIChatMessages(messages, limits) {
+  const list = Array.isArray(messages) ? messages : [];
+
+  const maxTurns = Number.isFinite(limits?.maxTurns) ? limits.maxTurns : DEFAULT_RSP4COPILOT_MAX_TURNS;
+  const maxMessages = Number.isFinite(limits?.maxMessages) ? limits.maxMessages : DEFAULT_RSP4COPILOT_MAX_MESSAGES;
+  const maxInputChars = Number.isFinite(limits?.maxInputChars) ? limits.maxInputChars : DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS;
+
+  const before = measureOpenAIChatMessages(list);
+
+  const turnsCap = maxTurns > 0 ? maxTurns : Infinity;
+  const messagesCap = maxMessages > 0 ? maxMessages : Infinity;
+  const charsCap = maxInputChars > 0 ? maxInputChars : Infinity;
+
+  if (turnsCap === Infinity && messagesCap === Infinity && charsCap === Infinity) {
+    return { ok: true, messages: list, trimmed: false, before, after: before };
+  }
+
+  const roleOf = (m) => (m && typeof m === "object" && typeof m.role === "string" ? m.role.trim().toLowerCase() : "");
+  const isSystemRole = (r) => r === "system" || r === "developer";
+
+  // Keep the leading system/developer prefix, then trim the conversation tail.
+  let systemPrefixEnd = 0;
+  while (systemPrefixEnd < list.length && isSystemRole(roleOf(list[systemPrefixEnd]))) systemPrefixEnd++;
+
+  const userIdxs = [];
+  for (let i = systemPrefixEnd; i < list.length; i++) {
+    if (roleOf(list[i]) === "user") userIdxs.push(i);
+  }
+  const lastUserIdx = userIdxs.length ? userIdxs[userIdxs.length - 1] : -1;
+
+  let sysStart = 0;
+  let restStart = systemPrefixEnd;
+
+  if (turnsCap !== Infinity && userIdxs.length > turnsCap) {
+    restStart = userIdxs[userIdxs.length - turnsCap];
+  }
+
+  const lens = list.map(estimateJsonChars);
+  const prefixSum = new Array(list.length + 1);
+  prefixSum[0] = 0;
+  for (let i = 0; i < list.length; i++) prefixSum[i + 1] = prefixSum[i] + lens[i];
+
+  const selectedCount = () => (systemPrefixEnd - sysStart) + (list.length - restStart);
+  const selectedChars = () => (prefixSum[systemPrefixEnd] - prefixSum[sysStart]) + (prefixSum[list.length] - prefixSum[restStart]);
+
+  let droppedTurns = 0;
+  let droppedSystem = 0;
+
+  const advanceRestStart = () => {
+    if (restStart >= list.length) return false;
+
+    // Drop any prelude before the first user message.
+    if (userIdxs.length && restStart < userIdxs[0]) {
+      restStart = userIdxs[0];
+      return true;
+    }
+
+    // Find the next user message after the current start.
+    let next = -1;
+    for (const u of userIdxs) {
+      if (u > restStart) {
+        next = u;
+        break;
+      }
+    }
+
+    // Refuse to drop the last user turn (must keep the latest user input).
+    if (lastUserIdx >= 0 && (next < 0 || next > lastUserIdx)) return false;
+
+    if (next >= 0) {
+      restStart = next;
+      return true;
+    }
+
+    // No user messages: drop everything.
+    restStart = list.length;
+    return true;
+  };
+
+  const enforceMessagesCap = () => {
+    while (messagesCap !== Infinity && selectedCount() > messagesCap) {
+      if (advanceRestStart()) {
+        droppedTurns++;
+        continue;
+      }
+      if (sysStart < systemPrefixEnd) {
+        sysStart++;
+        droppedSystem++;
+        continue;
+      }
+      return {
+        ok: false,
+        error: `Input exceeds RSP4COPILOT_MAX_MESSAGES=${maxMessages}; reduce chat history or raise the limit`,
+        before,
+      };
+    }
+    return { ok: true };
+  };
+
+  const enforceCharsCap = () => {
+    while (charsCap !== Infinity && selectedChars() > charsCap) {
+      if (advanceRestStart()) {
+        droppedTurns++;
+        continue;
+      }
+      if (sysStart < systemPrefixEnd) {
+        sysStart++;
+        droppedSystem++;
+        continue;
+      }
+      return {
+        ok: false,
+        error: `Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${maxInputChars}; reduce prompt size or raise the limit`,
+        before,
+      };
+    }
+    return { ok: true };
+  };
+
+  const r1 = enforceMessagesCap();
+  if (!r1.ok) return r1;
+  const r2 = enforceCharsCap();
+  if (!r2.ok) return r2;
+
+  const out = [...list.slice(sysStart, systemPrefixEnd), ...list.slice(restStart)];
+  const after = measureOpenAIChatMessages(out);
+  const trimmed = sysStart > 0 || restStart > systemPrefixEnd;
+  return { ok: true, messages: out, trimmed, before, after, droppedTurns, droppedSystem };
+}
+
 export function isDebugEnabled(env) {
   return parseBoolEnv(typeof env?.RSP4COPILOT_DEBUG === "string" ? env.RSP4COPILOT_DEBUG : "");
 }

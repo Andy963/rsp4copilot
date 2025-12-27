@@ -30,6 +30,11 @@ OPENAI_BASE_URL = "https://your-relay-server.example/openai"
 # Debug logging (optional)
 # RSP4COPILOT_DEBUG = "true" # set "false"/"0" to disable
 
+# Chat history limits (optional; defaults shown; set 0 to disable)
+# RSP4COPILOT_MAX_TURNS = 12
+# RSP4COPILOT_MAX_MESSAGES = 40
+# RSP4COPILOT_MAX_INPUT_CHARS = 300000
+
 # Default model for /v1/models endpoint
 DEFAULT_MODEL = "gpt-5.2"
 

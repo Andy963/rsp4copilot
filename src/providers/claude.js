@@ -2,6 +2,7 @@ import {
   appendInstructions,
   applyTemperatureTopPFromRequest,
   encodeSseData,
+  getRsp4CopilotLimits,
   joinPathPrefix,
   jsonError,
   jsonResponse,
@@ -13,6 +14,7 @@ import {
   redactHeadersForLog,
   safeJsonStringifyForLog,
   sseHeaders,
+  trimOpenAIChatMessages,
 } from "../common.js";
 
 export function isClaudeModelId(modelId) {
@@ -106,14 +108,20 @@ function openaiChatToClaudeMessages(messages) {
       continue;
     }
 
-    // Handle tool result messages separately
+    // Handle tool result messages: group consecutive tool results into one Claude `user` message
     if (role === "tool") {
       const toolResult = {
         type: "tool_result",
         tool_use_id: msg.tool_call_id || "",
         content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
       };
-      claudeMessages.push({ role: "user", content: [toolResult] });
+
+      const last = claudeMessages.length ? claudeMessages[claudeMessages.length - 1] : null;
+      if (last && last.role === "user" && Array.isArray(last.content) && last.content.every((p) => p && typeof p === "object" && p.type === "tool_result")) {
+        last.content.push(toolResult);
+      } else {
+        claudeMessages.push({ role: "user", content: [toolResult] });
+      }
       continue;
     }
 
@@ -227,7 +235,20 @@ export async function handleClaudeChatCompletions({ env, reqJson, model, stream,
   if (!claudeUrls.length) return jsonResponse(500, jsonError("Server misconfigured: invalid CLAUDE_BASE_URL", "server_error"));
 
   const claudeModel = normalizeClaudeModelId(model, env);
-  let { messages: claudeMessages, system: claudeSystem } = openaiChatToClaudeMessages(reqJson.messages || []);
+
+  const limits = getRsp4CopilotLimits(env);
+  const trimRes = trimOpenAIChatMessages(reqJson.messages || [], limits);
+  if (!trimRes.ok) return jsonResponse(400, jsonError(trimRes.error));
+  if (debug && trimRes.trimmed) {
+    logDebug(debug, reqId, "chat history trimmed", {
+      before: trimRes.before,
+      after: trimRes.after,
+      droppedTurns: trimRes.droppedTurns,
+      droppedSystem: trimRes.droppedSystem,
+    });
+  }
+
+  let { messages: claudeMessages, system: claudeSystem } = openaiChatToClaudeMessages(trimRes.messages);
 
   if (extraSystemText) {
     if (Array.isArray(claudeSystem) && claudeSystem.length > 0) {
@@ -520,4 +541,3 @@ export async function handleClaudeChatCompletions({ env, reqJson, model, stream,
 
   return new Response(readable, { status: 200, headers: sseHeaders() });
 }
-

@@ -3,11 +3,13 @@ import {
   applyTemperatureTopPFromRequest,
   encodeSseData,
   getSessionKey,
+  getRsp4CopilotLimits,
   joinPathPrefix,
   jsonError,
   jsonResponse,
   logDebug,
   maskSecret,
+  measureOpenAIChatMessages,
   normalizeAuthValue,
   normalizeBaseUrl,
   normalizeMessageContent,
@@ -17,6 +19,7 @@ import {
   safeJsonStringifyForLog,
   sha256Hex,
   sseHeaders,
+  trimOpenAIChatMessages,
 } from "../common.js";
 
 function buildUpstreamUrls(raw, responsesPathRaw) {
@@ -936,10 +939,14 @@ export async function handleOpenAIRequest({
   };
   if (debug) logDebug(debug, reqId, "openai upstream headers", { headers: redactHeadersForLog(headers) });
 
+  const limits = getRsp4CopilotLimits(env);
   const reasoningEffort = getReasoningEffort(reqJson, env);
   if (isTextCompletions) {
     const prompt = reqJson.prompt;
     const promptText = Array.isArray(prompt) ? (typeof prompt[0] === "string" ? prompt[0] : "") : typeof prompt === "string" ? prompt : String(prompt ?? "");
+    if (Number.isInteger(limits.maxInputChars) && limits.maxInputChars > 0 && promptText.length > limits.maxInputChars) {
+      return jsonResponse(400, jsonError(`Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${limits.maxInputChars}; reduce prompt size or raise the limit`));
+    }
     const responsesReq = {
       model,
       input: [{ role: "user", content: [{ type: "input_text", text: promptText }] }],
@@ -1243,10 +1250,36 @@ export async function handleOpenAIRequest({
   const messages = reqJson.messages;
   if (!Array.isArray(messages)) return jsonResponse(400, jsonError("Missing required field: messages"));
 
-  const sessionKey = getSessionKey(request, reqJson, token);
-  if (debug) logDebug(debug, reqId, "openai session", { sessionKey: sessionKey ? maskSecret(sessionKey) : "", multiTurnPossible: hasAssistantMessage(messages) });
+  const incomingStats = measureOpenAIChatMessages(messages);
+  const withinLimits =
+    (limits.maxTurns <= 0 || incomingStats.turns <= limits.maxTurns) &&
+    (limits.maxMessages <= 0 || incomingStats.messages <= limits.maxMessages) &&
+    (limits.maxInputChars <= 0 || incomingStats.inputChars <= limits.maxInputChars);
 
-  const { instructions, input } = chatMessagesToResponsesInput(messages);
+  const trimRes = trimOpenAIChatMessages(messages, limits);
+  if (!trimRes.ok) return jsonResponse(400, jsonError(trimRes.error));
+  const messagesForUpstream = trimRes.messages;
+  if (debug && trimRes.trimmed) {
+    logDebug(debug, reqId, "chat history trimmed", {
+      before: trimRes.before,
+      after: trimRes.after,
+      droppedTurns: trimRes.droppedTurns,
+      droppedSystem: trimRes.droppedSystem,
+    });
+  }
+
+  const sessionKey = getSessionKey(request, reqJson, token);
+  if (debug) {
+    logDebug(debug, reqId, "openai session", {
+      sessionKey: sessionKey ? maskSecret(sessionKey) : "",
+      multiTurnPossible: hasAssistantMessage(messagesForUpstream),
+      withinLimits,
+      incoming: incomingStats,
+      trimmed: trimRes.trimmed,
+    });
+  }
+
+  const { instructions, input } = chatMessagesToResponsesInput(messagesForUpstream);
   if (!input.length) return jsonResponse(400, jsonError("messages must include at least one non-system message"));
 
   const effectiveInstructions = appendInstructions(instructions, extraSystemText);
@@ -1272,10 +1305,10 @@ export async function handleOpenAIRequest({
       : null;
   if (Number.isInteger(maxTokens)) fullReq.max_output_tokens = maxTokens;
 
-  const lastAssistantIdx = indexOfLastAssistantMessage(messages);
-  const multiTurn = lastAssistantIdx >= 0;
+  const lastAssistantIdx = indexOfLastAssistantMessage(messagesForUpstream);
+  const multiTurn = withinLimits && lastAssistantIdx >= 0;
   const prevId = multiTurn ? await getSessionPreviousResponseId(sessionKey) : null;
-  const deltaMessages = prevId && lastAssistantIdx >= 0 ? messages.slice(lastAssistantIdx + 1) : [];
+  const deltaMessages = prevId && lastAssistantIdx >= 0 ? messagesForUpstream.slice(lastAssistantIdx + 1) : [];
   const deltaConv = deltaMessages.length ? chatMessagesToResponsesInput(deltaMessages) : { input: [] };
 
   const prevReq =
@@ -1283,7 +1316,7 @@ export async function handleOpenAIRequest({
       ? {
           model,
           input: deltaConv.input,
-          previous_response_id: prevId,
+      previous_response_id: prevId,
         }
       : null;
   if (prevReq) {
@@ -1307,7 +1340,7 @@ export async function handleOpenAIRequest({
       usingPreviousResponseId: Boolean(prevReq?.previous_response_id),
       previous_response_id: prevReq?.previous_response_id ? maskSecret(prevReq.previous_response_id) : "",
       deltaMessagesCount: deltaMessages.length,
-      totalMessagesCount: messages.length,
+      totalMessagesCount: messagesForUpstream.length,
       inputItems: Array.isArray(primaryReq?.input) ? primaryReq.input.length : 0,
       hasInstructions: Boolean(primaryReq?.instructions),
       instructionsLen: typeof primaryReq?.instructions === "string" ? primaryReq.instructions.length : 0,
@@ -1868,4 +1901,3 @@ export async function handleOpenAIRequest({
   if (debug) logDebug(debug, reqId, "request done", { elapsedMs: Date.now() - startedAt });
   return new Response(readable, { status: 200, headers: sseHeaders() });
 }
-

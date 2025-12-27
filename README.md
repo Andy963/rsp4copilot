@@ -242,6 +242,16 @@ RSP4COPILOT_DEBUG = "true" # 可选：开启详细调试日志（"false"/"0" 关
 - 支持 tool_use（函数调用）
 - 支持流式输出
 
+### 对话历史限制（可选）
+
+默认会对 `/v1/chat/completions` 的 `messages` 做裁剪（OpenAI / Gemini / Claude 都生效），避免上下文无限增长：
+
+- `RSP4COPILOT_MAX_TURNS`（默认 `12`）：最多保留最近 N 个 `user` turn（按 `role=user` 计数）
+- `RSP4COPILOT_MAX_MESSAGES`（默认 `40`）：最多保留最近 N 条 message
+- `RSP4COPILOT_MAX_INPUT_CHARS`（默认 `300000`）：输入大小上限（按 `messages` JSON 字符数估算）
+
+设置为 `0` 表示不限制；如果即使只保留最新一轮也超过上限（例如单条消息过大），会返回 `400`。
+
 ## 本地开发
 
 ```bash

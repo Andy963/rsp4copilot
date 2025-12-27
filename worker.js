@@ -18,6 +18,9 @@
  * - DEFAULT_MODEL (optional)
  * - MODELS or ADAPTER_MODELS (optional, comma-separated)
  * - RSP4COPILOT_DEBUG (optional, "true"/"1" enables verbose debug logs)
+ * - RSP4COPILOT_MAX_TURNS (optional, default: 12; set 0 to disable)
+ * - RSP4COPILOT_MAX_MESSAGES (optional, default: 40; set 0 to disable)
+ * - RSP4COPILOT_MAX_INPUT_CHARS (optional, default: 300000; set 0 to disable)
  */
 
 import { bearerToken, getWorkerAuthKeys, isDebugEnabled, jsonError, jsonResponse, logDebug, normalizeAuthValue } from "./src/common.js";

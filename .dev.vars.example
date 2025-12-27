@@ -31,6 +31,11 @@
 # Debug logging
 # RSP4COPILOT_DEBUG=true
 
+# Chat history limits (optional; defaults shown; set 0 to disable)
+# RSP4COPILOT_MAX_TURNS=12
+# RSP4COPILOT_MAX_MESSAGES=40
+# RSP4COPILOT_MAX_INPUT_CHARS=300000
+
 # For local dev only you can put secrets here (Cloudflare recommends using `wrangler secret put` for production):
 # OPENAI_API_KEY=sk-...
 # WORKER_AUTH_KEY=your-worker-auth-key

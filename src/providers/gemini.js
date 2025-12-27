@@ -2,6 +2,7 @@ import {
   appendInstructions,
   encodeSseData,
   getSessionKey,
+  getRsp4CopilotLimits,
   jsonError,
   jsonResponse,
   joinPathPrefix,
@@ -16,6 +17,7 @@ import {
   safeJsonStringifyForLog,
   sha256Hex,
   sseHeaders,
+  trimOpenAIChatMessages,
 } from "../common.js";
 
 export function isGeminiModelId(modelId) {
@@ -814,9 +816,22 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
   const sessionKey = getSessionKey(request, reqJson, token);
   const thoughtSigCache = sessionKey ? await getThoughtSignatureCache(sessionKey) : {};
 
+  const limits = getRsp4CopilotLimits(env);
+  const trimRes = trimOpenAIChatMessages(reqJson.messages || [], limits);
+  if (!trimRes.ok) return jsonResponse(400, jsonError(trimRes.error));
+  if (debug && trimRes.trimmed) {
+    logDebug(debug, reqId, "chat history trimmed", {
+      before: trimRes.before,
+      after: trimRes.after,
+      droppedTurns: trimRes.droppedTurns,
+      droppedSystem: trimRes.droppedSystem,
+    });
+  }
+  const reqJsonForUpstream = trimRes.trimmed ? { ...reqJson, messages: trimRes.messages } : reqJson;
+
   let geminiBody;
   try {
-    geminiBody = await openaiChatToGeminiRequest(reqJson, env, fetch, extraSystemText, thoughtSigCache);
+    geminiBody = await openaiChatToGeminiRequest(reqJsonForUpstream, env, fetch, extraSystemText, thoughtSigCache);
   } catch (err) {
     const message = err instanceof Error ? err.message : "failed to build Gemini request";
     return jsonResponse(400, jsonError(`Invalid request: ${message}`));
