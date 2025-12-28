@@ -101,6 +101,7 @@ export function trimOpenAIChatMessages(messages, limits) {
 
   let sysStart = 0;
   let restStart = systemPrefixEnd;
+  let restEnd = list.length;
 
   if (turnsCap !== Infinity && userIdxs.length > turnsCap) {
     restStart = userIdxs[userIdxs.length - turnsCap];
@@ -111,14 +112,15 @@ export function trimOpenAIChatMessages(messages, limits) {
   prefixSum[0] = 0;
   for (let i = 0; i < list.length; i++) prefixSum[i + 1] = prefixSum[i] + lens[i];
 
-  const selectedCount = () => (systemPrefixEnd - sysStart) + (list.length - restStart);
-  const selectedChars = () => (prefixSum[systemPrefixEnd] - prefixSum[sysStart]) + (prefixSum[list.length] - prefixSum[restStart]);
+  const selectedCount = () => (systemPrefixEnd - sysStart) + (restEnd - restStart);
+  const selectedChars = () => (prefixSum[systemPrefixEnd] - prefixSum[sysStart]) + (prefixSum[restEnd] - prefixSum[restStart]);
 
   let droppedTurns = 0;
   let droppedSystem = 0;
+  let droppedTail = 0;
 
   const advanceRestStart = () => {
-    if (restStart >= list.length) return false;
+    if (restStart >= restEnd) return false;
 
     // Drop any prelude before the first user message.
     if (userIdxs.length && restStart < userIdxs[0]) {
@@ -144,7 +146,19 @@ export function trimOpenAIChatMessages(messages, limits) {
     }
 
     // No user messages: drop everything.
-    restStart = list.length;
+    restStart = restEnd;
+    return true;
+  };
+
+  const dropTail = () => {
+    if (restEnd <= restStart) return false;
+
+    // Keep at least the latest user message (if present) and keep at least 1 message overall.
+    const minEnd = Math.max(restStart + 1, lastUserIdx >= 0 ? lastUserIdx + 1 : restStart + 1);
+    if (restEnd <= minEnd) return false;
+
+    restEnd--;
+    droppedTail++;
     return true;
   };
 
@@ -159,10 +173,8 @@ export function trimOpenAIChatMessages(messages, limits) {
         droppedSystem++;
         continue;
       }
-      // Last resort: drop from the front of the current turn (restStart)
-      // but keep at least the very last message.
-      if (restStart < list.length - 1) {
-        restStart++;
+      // Last resort: drop tail messages, but never drop the latest user input.
+      if (dropTail()) {
         continue;
       }
       return {
@@ -185,10 +197,8 @@ export function trimOpenAIChatMessages(messages, limits) {
         droppedSystem++;
         continue;
       }
-      // Last resort: drop from the front of the current turn (restStart)
-      // but keep at least the very last message.
-      if (restStart < list.length - 1) {
-        restStart++;
+      // Last resort: drop tail messages, but never drop the latest user input.
+      if (dropTail()) {
         continue;
       }
       return {
@@ -205,10 +215,10 @@ export function trimOpenAIChatMessages(messages, limits) {
   const r2 = enforceCharsCap();
   if (!r2.ok) return r2;
 
-  const out = [...list.slice(sysStart, systemPrefixEnd), ...list.slice(restStart)];
+  const out = [...list.slice(sysStart, systemPrefixEnd), ...list.slice(restStart, restEnd)];
   const after = measureOpenAIChatMessages(out);
-  const trimmed = sysStart > 0 || restStart > systemPrefixEnd;
-  return { ok: true, messages: out, trimmed, before, after, droppedTurns, droppedSystem };
+  const trimmed = sysStart > 0 || restStart > systemPrefixEnd || restEnd < list.length;
+  return { ok: true, messages: out, trimmed, before, after, droppedTurns, droppedSystem, droppedTail };
 }
 
 export function isDebugEnabled(env) {
