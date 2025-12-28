@@ -3,6 +3,9 @@ export function jsonResponse(status, obj, extraHeaders = undefined) {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "x-rsp4copilot": "1",
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-headers": "*",
   };
   if (extraHeaders && typeof extraHeaders === "object") {
     for (const [k, v] of Object.entries(extraHeaders)) {
@@ -23,8 +26,8 @@ export function parseBoolEnv(value) {
   return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on";
 }
 
-export const DEFAULT_RSP4COPILOT_MAX_TURNS = 12;
-export const DEFAULT_RSP4COPILOT_MAX_MESSAGES = 40;
+export const DEFAULT_RSP4COPILOT_MAX_TURNS = 40;
+export const DEFAULT_RSP4COPILOT_MAX_MESSAGES = 200;
 export const DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS = 300000;
 
 function parseIntEnv(raw, fallback) {
@@ -156,6 +159,12 @@ export function trimOpenAIChatMessages(messages, limits) {
         droppedSystem++;
         continue;
       }
+      // Last resort: drop from the front of the current turn (restStart)
+      // but keep at least the very last message.
+      if (restStart < list.length - 1) {
+        restStart++;
+        continue;
+      }
       return {
         ok: false,
         error: `Input exceeds RSP4COPILOT_MAX_MESSAGES=${maxMessages}; reduce chat history or raise the limit`,
@@ -174,6 +183,12 @@ export function trimOpenAIChatMessages(messages, limits) {
       if (sysStart < systemPrefixEnd) {
         sysStart++;
         droppedSystem++;
+        continue;
+      }
+      // Last resort: drop from the front of the current turn (restStart)
+      // but keep at least the very last message.
+      if (restStart < list.length - 1) {
+        restStart++;
         continue;
       }
       return {
@@ -445,8 +460,10 @@ export function sseHeaders(extraHeaders = undefined) {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache",
     "x-accel-buffering": "no",
-    connection: "close",
     "x-rsp4copilot": "1",
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-headers": "*",
   };
   if (extraHeaders && typeof extraHeaders === "object") {
     for (const [k, v] of Object.entries(extraHeaders)) {

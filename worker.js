@@ -60,6 +60,19 @@ export default {
       const path = url.pathname.replace(/\/+$/, "") || "/";
       const startedAt = Date.now();
 
+      // Handle CORS preflight
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            "access-control-allow-origin": "*",
+            "access-control-allow-methods": "GET, POST, OPTIONS",
+            "access-control-allow-headers": "*",
+            "access-control-max-age": "86400",
+          },
+        });
+      }
+
       if (debug) {
         const authHeader = request.headers.get("authorization") || "";
         const hasBearer = typeof authHeader === "string" && authHeader.toLowerCase().includes("bearer ");
@@ -193,8 +206,9 @@ export default {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err ?? "unknown error");
-      logDebug(debug, reqId, "unhandled exception", { error: message });
-      return jsonResponse(500, jsonError("Internal server error", "server_error"));
+      const stack = err instanceof Error ? err.stack : "";
+      console.error(`[rsp4copilot][${reqId}] critical error: ${message}`, { stack });
+      return jsonResponse(500, jsonError(`Internal Server Error: ${message}`, "server_error"));
     }
   },
 };
