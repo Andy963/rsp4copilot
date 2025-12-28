@@ -139,6 +139,9 @@ export default {
       }
 
       if (request.method !== "POST") {
+        if (path === "/v1/chat/completions" || path === "/chat/completions" || path === "/v1/completions" || path === "/completions") {
+          return jsonResponse(405, jsonError("Method not allowed (use POST)", "method_not_allowed"), { allow: "POST" });
+        }
         return jsonResponse(404, jsonError("Not found", "not_found"));
       }
 

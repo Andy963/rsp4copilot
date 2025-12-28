@@ -41,10 +41,9 @@ function buildUpstreamUrls(raw, responsesPathRaw) {
 
   const inferResponsesPath = (basePath) => {
     const p = (basePath || "").replace(/\/+$/, "");
-    // If the base already ends with /v1, prefer appending /responses (avoid /v1/v1/responses).
-    // Many gateways use an "/openai" prefix that already maps to an upstream "/v1".
-    if (p.endsWith("/openai") || p.endsWith("/openai/v1")) return "/responses";
-    if (p.endsWith("/v1")) return "/responses";
+    // Prefer `/v1/responses` unless the base already includes `/v1`.
+    // Avoid generating `/v1/v1/responses` when a base already ends with `/v1` (or `/openai/v1`).
+    if (p.endsWith("/openai/v1") || p.endsWith("/v1")) return "/responses";
     return "/v1/responses";
   };
 
@@ -69,11 +68,17 @@ function buildUpstreamUrls(raw, responsesPathRaw) {
           ? configuredResponsesPath
           : `/${configuredResponsesPath}`
         : inferResponsesPath(basePath);
-      const candidates = [
+      const candidatesRaw = [
         joinPathPrefix(basePath, preferred),
         joinPathPrefix(basePath, "/v1/responses"),
         joinPathPrefix(basePath, "/responses"),
       ];
+      const candidates = candidatesRaw
+        .filter((path) => !String(path || "").includes("/v1/v1/responses"))
+        .sort((a, b) => {
+          const score = (p) => (String(p || "").includes("/v1/responses") ? 0 : 1);
+          return score(a) - score(b);
+        });
 
       for (const path of candidates) {
         const u = new URL(normalized);
@@ -673,6 +678,68 @@ async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = fa
   let lastText = "";
   let firstErr = null; // { status, text }
   let exhaustedRetryable = false;
+  let sawEmptyEventStream = false;
+
+  const retryEmptySseAsNonStream = async (variantObj) => {
+    if (!variantObj || typeof variantObj !== "object") return null;
+
+    const headers2 = { ...(headers && typeof headers === "object" ? headers : {}) };
+    headers2.accept = "application/json";
+
+    const v0 = variantObj;
+    const tries = [];
+
+    const vStreamFalse = { ...v0, stream: false };
+    tries.push({ label: "stream:false", value: vStreamFalse });
+
+    const vNoStream = { ...v0 };
+    delete vNoStream.stream;
+    tries.push({ label: "no-stream-field", value: vNoStream });
+
+    for (let j = 0; j < tries.length; j++) {
+      const t = tries[j];
+      const body = JSON.stringify(t.value);
+      if (debug) {
+        logDebug(debug, reqId, "openai upstream empty-sse retry", {
+          url: upstreamUrl,
+          mode: t.label,
+          bodyLen: body.length,
+          bodyPreview: previewString(body, 1200),
+        });
+      }
+
+      let resp2;
+      try {
+        const t0 = Date.now();
+        resp2 = await fetch(upstreamUrl, { method: "POST", headers: headers2, body });
+        if (debug) {
+          logDebug(debug, reqId, "openai upstream empty-sse retry response", {
+            url: upstreamUrl,
+            mode: t.label,
+            status: resp2.status,
+            ok: resp2.ok,
+            contentType: resp2.headers.get("content-type") || "",
+            elapsedMs: Date.now() - t0,
+          });
+        }
+      } catch (err) {
+        if (debug) {
+          const message = err instanceof Error ? err.message : String(err ?? "fetch failed");
+          logDebug(debug, reqId, "openai upstream empty-sse retry fetch failed", { url: upstreamUrl, mode: t.label, error: message });
+        }
+        continue;
+      }
+
+      // If it still comes back as an empty SSE, keep trying other modes.
+      if (resp2.ok && (await isProbablyEmptyEventStream(resp2))) continue;
+
+      // Return the first non-empty response (ok or error) so the caller can handle it.
+      return resp2;
+    }
+
+    return null;
+  };
+
   for (let i = 0; i < variants.length; i++) {
     const body = JSON.stringify(variants[i]);
     if (debug) {
@@ -706,6 +773,30 @@ async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = fa
       const message = err instanceof Error ? err.message : "fetch failed";
       return { ok: false, status: 502, error: jsonError(`Upstream fetch failed: ${message}`, "bad_gateway"), upstreamUrl };
     }
+    if (resp.ok && (await isProbablyEmptyEventStream(resp))) {
+      sawEmptyEventStream = true;
+      if (debug) {
+        logDebug(debug, reqId, "openai upstream empty event stream", {
+          url: upstreamUrl,
+          variant: i,
+          status: resp.status,
+          contentType: resp.headers.get("content-type") || "",
+          contentLength: resp.headers.get("content-length") || "",
+        });
+      }
+
+      // Some relays incorrectly return `200 text/event-stream` with no events.
+      // Retry the same request in non-stream mode to (a) possibly get a proper JSON response or (b) surface a real error body.
+      const nonStream = await retryEmptySseAsNonStream(variants[i]);
+      if (!nonStream) {
+        lastStatus = 502;
+        lastText = JSON.stringify(jsonError("Upstream returned an empty event stream", "bad_gateway"));
+        if (!firstErr) firstErr = { status: lastStatus, text: lastText };
+        continue;
+      }
+
+      resp = nonStream;
+    }
     if (resp.status >= 400) {
       lastStatus = resp.status;
       lastText = await resp.text().catch(() => "");
@@ -723,6 +814,13 @@ async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = fa
       }
     }
     return { ok: true, resp, upstreamUrl };
+  }
+  if (sawEmptyEventStream && firstErr) {
+    try {
+      return { ok: false, status: firstErr.status, error: JSON.parse(firstErr.text), upstreamUrl };
+    } catch {
+      return { ok: false, status: firstErr.status, error: jsonError("Upstream returned an empty event stream", "bad_gateway"), upstreamUrl };
+    }
   }
   if (exhaustedRetryable && firstErr) {
     try {
@@ -746,30 +844,54 @@ function shouldTryNextUpstreamUrl(status) {
 }
 
 async function isProbablyEmptyEventStream(resp) {
+  let reader = null;
   try {
     const ct = (resp?.headers?.get("content-type") || "").toLowerCase();
     if (!ct.includes("text/event-stream")) return false;
     if (!resp?.body) return true;
 
     const clone = resp.clone();
-    const reader = clone.body.getReader();
+    reader = clone.body.getReader();
 
-    const timeoutMs = 50;
-    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
-    const first = await Promise.race([reader.read(), timeout]);
-    try {
-      await reader.cancel();
-    } catch {}
+    let bytesSeen = 0;
+    const deadlineMs = 150;
+    const startedAt = Date.now();
 
-    // If it hasn't produced anything quickly, assume it's not empty (could just be slow model output).
-    if (!first) return false;
+    const readWithTimeout = (ms) => {
+      let timeoutId = null;
+      const timeout = new Promise((resolve) => {
+        timeoutId = setTimeout(() => resolve({ timeout: true }), ms);
+      });
+      const read = reader.read().then((r) => ({ timeout: false, ...r }));
+      return Promise.race([read, timeout]).finally(() => {
+        if (timeoutId) clearTimeout(timeoutId);
+      });
+    };
 
-    const { done, value } = first;
-    if (done) return true;
-    if (!value || value.length === 0) return true;
+    while (Date.now() - startedAt < deadlineMs) {
+      const remaining = Math.max(0, deadlineMs - (Date.now() - startedAt));
+      const first = await readWithTimeout(Math.min(50, remaining));
+
+      // If it hasn't produced anything quickly, assume it's not empty (could just be slow model output).
+      if (first?.timeout) return false;
+
+      const { done, value } = first || {};
+      if (done) return bytesSeen === 0;
+
+      if (value && typeof value.length === "number") {
+        if (value.length > 0) return false;
+        // Some runtimes can yield a zero-length chunk; treat as inconclusive and keep reading briefly.
+        bytesSeen += value.length;
+      }
+    }
+
     return false;
   } catch {
     return false;
+  } finally {
+    try {
+      await reader?.cancel();
+    } catch {}
   }
 }
 
@@ -789,17 +911,6 @@ async function selectUpstreamResponseAny(upstreamUrls, headers, variants, debug 
         status: sel.status,
         error: sel.error,
       });
-    }
-    if (sel.ok && (await isProbablyEmptyEventStream(sel.resp))) {
-      if (!firstErr) {
-        firstErr = {
-          ok: false,
-          status: 502,
-          error: jsonError("Upstream returned an empty event stream", "bad_gateway"),
-          upstreamUrl: sel.upstreamUrl,
-        };
-      }
-      continue;
     }
     if (sel.ok) return sel;
     if (!firstErr) firstErr = sel;
