@@ -18,7 +18,7 @@ import {
   sha256Hex,
   sseHeaders,
   trimOpenAIChatMessages,
-} from "../common.js";
+} from "../common";
 
 export function isGeminiModelId(modelId) {
   const v = typeof modelId === "string" ? modelId.trim().toLowerCase() : "";
@@ -154,7 +154,7 @@ function mergeJsonSchemasShallow(base, next) {
   return out;
 }
 
-function jsonSchemaToGeminiSchema(jsonSchema, rootSchema, refStack) {
+function jsonSchemaToGeminiSchema(jsonSchema, rootSchema = jsonSchema, refStack = undefined) {
   if (!jsonSchema || typeof jsonSchema !== "object") return {};
 
   const root = rootSchema && typeof rootSchema === "object" ? rootSchema : jsonSchema;
@@ -187,7 +187,7 @@ function jsonSchemaToGeminiSchema(jsonSchema, rootSchema, refStack) {
   const listSchemaFieldNames = new Set(["anyOf", "oneOf"]);
   const dictSchemaFieldNames = new Set(["properties"]);
 
-  const out = {};
+  const out: any = {};
 
   const input = { ...jsonSchema };
 
@@ -289,9 +289,6 @@ function jsonSchemaToGeminiSchema(jsonSchema, rootSchema, refStack) {
 
 function bytesToBase64(bytes) {
   if (!bytes) return "";
-  // Node.js
-  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
-  // Workers
   let binary = "";
   const chunkSize = 0x8000;
   for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -424,7 +421,7 @@ function openaiToolsToGeminiFunctionDeclarations(tools) {
     if (!name) continue;
     const description = fn && typeof fn.description === "string" ? fn.description : undefined;
     const params = fn && fn.parameters && typeof fn.parameters === "object" ? fn.parameters : undefined;
-    const decl = { name };
+    const decl: any = { name };
     if (description) decl.description = description;
     if (params) decl.parameters = jsonSchemaToGeminiSchema(params);
     out.push(decl);
@@ -536,7 +533,7 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
         }
 
         // Build the functionCall part (2025 API: thoughtSignature is sibling to functionCall in same part)
-        const fcPart = {
+        const fcPart: any = {
           functionCall: {
             name: c.name,
             args: parsedArgs.ok && parsedArgs.value && typeof parsedArgs.value === "object" ? parsedArgs.value : { _raw: c.arguments },
@@ -611,7 +608,7 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
   }
 
   const systemText = appendInstructions(systemTextParts.join("\n").trim(), extraSystemText);
-  const generationConfig = {};
+  const generationConfig: any = {};
   if ("temperature" in reqJson) generationConfig.temperature = reqJson.temperature;
   if ("top_p" in reqJson) generationConfig.topP = reqJson.top_p;
   if ("presence_penalty" in reqJson) generationConfig.presencePenalty = reqJson.presence_penalty;
@@ -705,7 +702,7 @@ function geminiExtractTextAndToolCalls(respJson) {
       const name = typeof fc.name === "string" ? fc.name.trim() : "";
       if (!name) continue;
       const argsStr = geminiArgsToJsonString(fc.args);
-      const tcItem = {
+      const tcItem: any = {
         id: `call_${crypto.randomUUID().replace(/-/g, "")}`,
         type: "function",
         function: { name, arguments: argsStr && argsStr.trim() ? argsStr : "{}" },
@@ -757,9 +754,10 @@ async function thoughtSignatureCacheUrl(sessionKey) {
 
 async function getThoughtSignatureCache(sessionKey) {
   try {
-    if (!sessionKey || typeof caches === "undefined" || !caches.default) return {};
+    const cache = !sessionKey || typeof caches === "undefined" ? null : ((caches as any).default ?? null);
+    if (!cache) return {};
     const url = await thoughtSignatureCacheUrl(sessionKey);
-    const resp = await caches.default.match(url);
+    const resp = await cache.match(url);
     if (!resp) return {};
     const data = await resp.json().catch(() => null);
     return data && typeof data === "object" ? data : {};
@@ -770,9 +768,10 @@ async function getThoughtSignatureCache(sessionKey) {
 
 async function setThoughtSignatureCache(sessionKey, callId, thoughtSignature, thought, name) {
   try {
-    if (!sessionKey || !callId || typeof caches === "undefined" || !caches.default) return;
+    const cache = !sessionKey || !callId || typeof caches === "undefined" ? null : ((caches as any).default ?? null);
+    if (!cache) return;
     // Get existing cache
-    const existing = await getThoughtSignatureCache(sessionKey);
+    const existing: any = await getThoughtSignatureCache(sessionKey);
     // Add new entry
     existing[callId] = {
       thought_signature: thoughtSignature || "",
@@ -781,9 +780,9 @@ async function setThoughtSignatureCache(sessionKey, callId, thoughtSignature, th
       updated_at: Date.now(),
     };
     // Limit cache size (keep last 100 entries)
-    const entries = Object.entries(existing);
+    const entries: any[] = Object.entries(existing);
     if (entries.length > 100) {
-      entries.sort((a, b) => (b[1].updated_at || 0) - (a[1].updated_at || 0));
+      entries.sort((a, b) => ((b?.[1]?.updated_at as any) || 0) - ((a?.[1]?.updated_at as any) || 0));
       const kept = Object.fromEntries(entries.slice(0, 100));
       Object.keys(existing).forEach((k) => {
         if (!(k in kept)) delete existing[k];
@@ -797,7 +796,7 @@ async function setThoughtSignatureCache(sessionKey, callId, thoughtSignature, th
         "cache-control": "max-age=86400",
       },
     });
-    await caches.default.put(req, resp);
+    await cache.put(req, resp);
   } catch {
     // ignore
   }
@@ -1001,14 +1000,14 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
       await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
     };
 
-    const emitToolCallDelta = async (meta, argsDelta) => {
-      if (!meta || typeof meta !== "object") return;
-      await ensureAssistantRoleSent();
-      const fn = {};
-      if (typeof meta.name === "string" && meta.name.trim()) fn.name = meta.name.trim();
-      if (typeof argsDelta === "string" && argsDelta) fn.arguments = argsDelta;
-      const tcItem = {
-        index: meta.index,
+      const emitToolCallDelta = async (meta, argsDelta) => {
+        if (!meta || typeof meta !== "object") return;
+        await ensureAssistantRoleSent();
+        const fn: any = {};
+        if (typeof meta.name === "string" && meta.name.trim()) fn.name = meta.name.trim();
+        if (typeof argsDelta === "string" && argsDelta) fn.arguments = argsDelta;
+        const tcItem = {
+          index: meta.index,
         id: meta.id,
         type: "function",
         function: fn,
@@ -1040,7 +1039,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
       const key = `${name}\n${argsStr}`;
 
       if (!toolCallKeyToMeta.has(key)) {
-        const meta = {
+        const meta: any = {
           id: `call_${crypto.randomUUID().replace(/-/g, "")}`,
           index: nextToolIndex++,
           name,
@@ -1169,7 +1168,9 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
           const obj = JSON.parse(raw);
           const extracted = geminiExtractTextAndToolCalls(obj);
           if (Array.isArray(extracted.toolCalls)) {
-            for (const tc of extracted.toolCalls) await upsertToolCall(tc.function?.name, safeJsonParse(tc.function?.arguments || "{}").value);
+            for (const tc of extracted.toolCalls) {
+              await upsertToolCall(tc.function?.name, safeJsonParse(tc.function?.arguments || "{}").value, undefined, undefined);
+            }
           }
           if (extracted.text) await emitTextDelta(extracted.text);
           if (typeof extracted.finish_reason === "string" && extracted.finish_reason) lastFinishReason = extracted.finish_reason;

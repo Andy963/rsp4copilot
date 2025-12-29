@@ -1,176 +1,135 @@
 # rsp4copilot (Cloudflare Worker)
 
-把 **OpenAI Responses API** 转换成 OpenAI 兼容的 `/v1/chat/completions` 接口，同时支持 **Gemini** 和 **Claude** 模型。
+在 Cloudflare Workers 上运行的 **LLM API 互转 / 路由网关**：同一套后端 provider 配置，同时暴露多种“前端协议”入口，方便 VS Code 等客户端按自己支持的协议接入。
 
-主要用途：让 VS Code 的 [OAI Compatible Provider for Copilot](https://marketplace.visualstudio.com/items?itemName=nicepkg.oai-compatible-copilot) 插件能够使用 OpenAI Responses API、Gemini、Claude 等模型。
+主要用途：让 VS Code 的 [OAI Compatible Provider for Copilot](https://marketplace.visualstudio.com/items?itemName=nicepkg.oai-compatible-copilot) 插件可以使用 OpenAI Responses、Gemini、Claude 等上游（通过中转/Relay）。
 
-> **注意**：本项目使用 [Claude Relay Server (CRS)](https://github.com/anthropics/claude-relay-server) 等中转服务作为上游，**未适配官方 API Key 直连**。如果你使用官方 API，可能需要自行调整。
+## 入口协议（多选）
 
-## 支持的模型
+- OpenAI Chat Completions：`POST /v1/chat/completions`
+- OpenAI Responses：`POST /v1/responses`（兼容：`/responses`、`/openai/v1/responses`）
+- Claude Messages：`POST /claude/v1/messages`、`POST /claude/v1/messages/count_tokens`
+- Gemini：`POST /gemini/v1beta/models/{model}:generateContent`、`POST /gemini/v1beta/models/{model}:streamGenerateContent?alt=sse`
 
-| 上游 | 模型匹配规则 | 示例 |
-|------|-------------|------|
-| OpenAI Responses API | 默认 | `gpt-5.1`, `gpt-5.1-codex-max`, `gpt-5.2`, `gpt-5.2-codex` |
-| Gemini API | 以 `gemini-` 开头 | `gemini-3-flash-preview`, `gemini-3-pro-preview` |
-| Claude API | 以 `claude-` 开头 | `claude-haiku-4-5-20251001`, `claude-sonnet-4-5-20250929`, `claude-opus-4-5-20251101` |
+## 模型列表
 
-## 快速开始
+- OpenAI 风格：`GET /v1/models`（同样支持 `/openai/v1/models`、`/claude/v1/models`、`/models`）
+- Gemini 风格：`GET /gemini/v1beta/models`
 
-### 1. 克隆并安装依赖
+## 统一模型命名（配置驱动）
+
+请求里的 `model` 支持两种写法：
+- **短 ID**：直接写 `modelName`（推荐；前提是该名字在所有 provider 里唯一）
+- **完整 ID**：写 `providerId.modelName`（显式指定 provider；当短 ID 有歧义时使用）
+
+如果客户端会额外发送 provider 信息，本 Worker 也会尽量识别：
+- JSON body 字段：`provider` / `owned_by` / `ownedBy`
+- Gemini 兼容：`?provider=`（或 `?owned_by=`）
+
+## 入站鉴权（必须）
+
+所有请求都需要携带你的 Worker 访问密钥（不是上游模型 key）：
+- Worker 侧配置：`WORKER_AUTH_KEY` 或 `WORKER_AUTH_KEYS`（逗号分隔）
+- 客户端传递方式：
+  - `Authorization: Bearer <key>` 或 `Authorization: <key>`
+  - `x-api-key: <key>`
+  - Gemini 兼容：`x-goog-api-key: <key>` 或 `?key=<key>`（仅当路径以 `/gemini/` 开头）
+  - Claude 兼容：`anthropic-api-key: <key>` / `x-anthropic-api-key: <key>`
+
+## 配置（RSP4COPILOT_CONFIG）
+
+唯一必需的网关配置是 `RSP4COPILOT_CONFIG`（JSON/JSONC 字符串）。
+
+> 注意：Worker 运行时只读取环境变量，不会从仓库读取 `configs/*.jsonc`；配置里的 `baseURL` 是「上游地址」（不要填本 Worker 的对外地址，否则会自我转发形成循环）。
+
+示例见：
+- `.dev.vars.example`
+- `wrangler.toml.example`
+- `configs/rsp4copilot.config.example.jsonc`
+
+### RSP4COPILOT_CONFIG 示例（单一 OpenAI Responses 上游）
+
+```jsonc
+{
+  "version": 1,
+  "providers": {
+    "openai": {
+      "type": "openai-responses",
+      "baseURL": "https://your-relay.example/openai",
+      "apiKey": "REPLACE_ME",
+      "quirks": {
+        "noInstructions": false,
+        "noPreviousResponseId": false
+      },
+      "models": {
+        "gpt-5.2": { "upstreamModel": "gpt-5.2" }
+      }
+    }
+  }
+}
+```
+
+### 常用 provider.type
+
+- `openai-responses`：上游走 Responses API（支持 reasoning、tool calling、SSE 等）
+- `openai-chat-completions`：上游走 Chat Completions API（`/v1/chat/completions`）
+- `gemini`：上游走 Gemini `generateContent` / `streamGenerateContent`
+- `claude`：上游走 Claude `/v1/messages`
+
+## 本地运行（不部署）
 
 ```bash
-git clone https://github.com/user/rsp4copilot.git
-cd rsp4copilot
 npm install
+cp .dev.vars.example .dev.vars
+npx wrangler dev --local --port 8788
 ```
 
-### 2. 复制并编辑配置文件
+## 快速 curl
 
+OpenAI Chat:
 ```bash
-cp wrangler.toml.example wrangler.toml
+curl -sS http://127.0.0.1:8788/v1/chat/completions \
+  -H "Authorization: Bearer REPLACE_ME" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-5.2","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-编辑 `wrangler.toml`，配置你的中转服务 URL：
-
-```toml
-[vars]
-OPENAI_BASE_URL = "https://your-relay-server.example/openai"
-GEMINI_BASE_URL = "https://your-relay-server.example/gemini"
-CLAUDE_BASE_URL = "https://your-relay-server.example/api"
-```
-
-### 3. 生成 WORKER_AUTH_KEY
-
-这是访问你的 Worker 的密钥，建议使用随机字符串：
-
+OpenAI Responses:
 ```bash
-# Linux/macOS
-openssl rand -hex 32
-
-# 或使用 Node.js
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-
-# 或使用 Python
-python -c "import secrets; print(secrets.token_hex(32))"
+curl -sS http://127.0.0.1:8788/v1/responses \
+  -H "Authorization: Bearer REPLACE_ME" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-5.2","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}'
 ```
 
-### 4. 配置 Secrets
-
+Claude Messages:
 ```bash
-npx wrangler login
-npx wrangler secret put WORKER_AUTH_KEY      # 粘贴上一步生成的密钥
-# 可选：多 Key（逗号分隔），用于多人/多客户端或 Key 轮换
-# npx wrangler secret put WORKER_AUTH_KEYS
-npx wrangler secret put OPENAI_API_KEY       # OpenAI API Key
-npx wrangler secret put GEMINI_API_KEY       # Gemini API Key（可选）
-npx wrangler secret put CLAUDE_API_KEY       # Claude API Key（可选）
+curl -sS http://127.0.0.1:8788/claude/v1/messages \
+  -H "Authorization: Bearer REPLACE_ME" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-5-20250929","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}'
 ```
 
-### 5. 部署
-
+Gemini streaming:
 ```bash
-npm run deploy
+curl -N "http://127.0.0.1:8788/gemini/v1beta/models/gemini-3-flash-preview:streamGenerateContent?alt=sse" \
+  -H "x-goog-api-key: REPLACE_ME" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
 ```
 
-部署成功后会显示 Worker URL，例如：`https://rsp4copilot.<your-account>.workers.dev`
+## 在 VS Code Copilot 插件中使用
 
-## 在 VS Code 中使用
+### settings.json 示例
 
-### 安装插件
-
-在 VS Code 扩展市场搜索并安装：**OAI Compatible Provider for Copilot**
-
-或直接访问：https://marketplace.visualstudio.com/items?itemName=nicepkg.oai-compatible-copilot
-
-### 配置 settings.json
-
-打开 VS Code 设置（JSON），添加以下配置：
+> 重点：`id` 可以填短模型名（例如 `gpt-5.2`），并把 `WORKER_AUTH_KEY` 作为 API Key 填给插件。
+> 若出现同名模型（有歧义），再改用 `providerId.modelName`。
 
 ```json
 {
-  "oaicopilot.baseUrl": "https://rsp4copilot.<your-account>.workers.dev/v1",
+  "oaicopilot.baseUrl": "https://<your-worker-domain>/v1",
   "oaicopilot.models": [
-    {
-      "id": "gpt-5.1",
-      "owned_by": "openai",
-      "context_length": 400000,
-      "max_tokens": 16384,
-      "temperature": 0,
-      "top_p": 1,
-      "vision": true
-    },
-    {
-      "id": "gpt-5.1-codex-max",
-      "owned_by": "openai",
-      "context_length": 400000,
-      "max_tokens": 128000,
-      "temperature": 0,
-      "top_p": 1,
-      "vision": true
-    },
-    {
-      "id": "gpt-5.2",
-      "owned_by": "openai",
-      "context_length": 400000,
-      "max_tokens": 16384,
-      "temperature": 0,
-      "top_p": 1,
-      "vision": true
-    },
-    {
-      "id": "gpt-5.2-codex",
-      "owned_by": "openai",
-      "context_length": 400000,
-      "max_tokens": 128000,
-      "temperature": 0,
-      "top_p": 1,
-      "vision": true
-    },
-    {
-      "id": "gemini-3-flash-preview",
-      "owned_by": "google",
-      "context_length": 1048576,
-      "max_tokens": 65536,
-      "temperature": 0,
-      "top_p": 1,
-      "vision": true
-    },
-    {
-      "id": "gemini-3-pro-preview",
-      "owned_by": "google",
-      "context_length": 1048576,
-      "max_tokens": 65536,
-      "temperature": 0,
-      "top_p": 1,
-      "vision": true
-    },
-    {
-      "id": "claude-haiku-4-5-20251001",
-      "owned_by": "anthropic",
-      "context_length": 2097152,
-      "max_tokens": 131072,
-      "temperature": 0,
-      "top_p": 1,
-      "vision": true
-    },
-    {
-      "id": "claude-sonnet-4-5-20250929",
-      "owned_by": "anthropic",
-      "context_length": 1048576,
-      "max_tokens": 65536,
-      "temperature": 0,
-      "top_p": 1,
-      "vision": true
-    },
-    {
-      "id": "claude-opus-4-5-20251101",
-      "owned_by": "anthropic",
-      "context_length": 1048576,
-      "max_tokens": 65536,
-      "temperature": 0,
-      "top_p": 1,
-      "vision": true
-    }
+    { "id": "gpt-5.2", "owned_by": "openai", "context_length": 200000, "max_tokens": 8192, "temperature": 0, "top_p": 1 }
   ]
 }
 ```
@@ -178,134 +137,18 @@ npm run deploy
 ### 配置 API Key
 
 1. 打开 VS Code 命令面板（`Ctrl+Shift+P` / `Cmd+Shift+P`）
-2. 搜索并运行：`OAICopilot: Set OAI Compatible Multi-Provider Apikey`
-3. Provider 选择对应的 `owned_by` 值（如 `openai`、`google`、`anthropic`）
-4. API Key 填入你的 `WORKER_AUTH_KEY`（所有 provider 使用同一个 key）
+2. 运行：`OAICopilot: Set OAI Compatible Multi-Provider Apikey`
+3. Provider 随便选（如 `openai`/`google`/`anthropic`），API Key 填 `WORKER_AUTH_KEY`
 
-### 使用模型
+## 在 VS Code Continue 插件中使用
 
-1. 打开 GitHub Copilot Chat 面板
-2. 点击模型选择器 → `Manage Models...` → `OAI Compatible`
-3. 勾选你想使用的模型
-4. 在聊天中选择对应模型即可使用
+Continue 的 OpenAI provider 可能会直接调用 `POST /v1/responses`；本 Worker 已兼容该路由。
 
-## 绑定自定义域名（可选）
+配置要点：
+- `apiBase` 填本 Worker 的对外地址（建议 `https://<your-worker-domain>/v1`）
+- `apiKey` 填 `WORKER_AUTH_KEY`（不是上游 key）
+- `model` 填短模型名（如 `gpt-5.2` / `claude-sonnet-...` / `gemini-...`）
 
-如果你有自己的域名，可以在 Cloudflare Dashboard 中绑定：
+## Legacy（可选）
 
-1. 进入 Cloudflare Dashboard → Workers & Pages → 你的 Worker
-2. Settings → Triggers → Custom Domains
-3. 添加你的域名（如 `api.yourdomain.com`）
-
-然后把 `oaicopilot.baseUrl` 改为 `https://api.yourdomain.com/v1`
-
-## 上游配置详解
-
-> **重要**：本项目设计用于 [Claude Relay Server (CRS)](https://github.com/anthropics/claude-relay-server) 等中转服务，未适配官方 API Key 直连。以下示例 URL 仅供参考，请替换为你的中转服务地址。
-
-### OpenAI Responses API
-
-```toml
-[vars]
-OPENAI_BASE_URL = "https://your-relay-server.example/openai"
-```
-
-- `RESP_RESPONSES_PATH`（可选）：默认 `/v1/responses`
-- `RESP_REASONING_EFFORT`（可选）：`low` / `medium` / `high` / `off`
-
-### Gemini API
-
-```toml
-[vars]
-GEMINI_BASE_URL = "https://your-relay-server.example/gemini"
-GEMINI_DEFAULT_MODEL = "gemini-3-pro-preview"
-```
-
-特性：
-- 支持 Gemini 2025 API 的 `thought_signature`
-- 自动缓存用于多轮对话
-- 远程图片自动下载并内联为 base64
-
-### Claude API
-
-```toml
-[vars]
-CLAUDE_BASE_URL = "https://your-relay-server.example/api"
-CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
-CLAUDE_MESSAGES_PATH = "/messages" # 可选：覆盖推断出的 Messages API 路径（或用 "/v1/messages"）
-CLAUDE_MAX_TOKENS = 8192 # 可选：限制 Claude 输出 token 上限（设为 0 表示不限制）
-RSP4COPILOT_DEBUG = "true" # 可选：开启详细调试日志（"false"/"0" 关闭）
-```
-
-特性：
-- 完整支持 Claude Messages API
-- 支持 tool_use（函数调用）
-- 支持流式输出
-
-### 对话历史限制（可选）
-
-默认会对 `/v1/chat/completions` 的 `messages` 做裁剪（OpenAI / Gemini / Claude 都生效），避免上下文无限增长：
-
-- `RSP4COPILOT_MAX_TURNS`（默认 `40`）：最多保留最近 N 个 `user` turn（按 `role=user` 计数）
-- `RSP4COPILOT_MAX_MESSAGES`（默认 `200`）：最多保留最近 N 条消息（包含 system/user/assistant/tool）
-- `RSP4COPILOT_MAX_INPUT_CHARS`（默认 `300000`）：估算的输入字符数上限
-
-设置为 `0` 表示不限制；如果即使只保留最新一轮也超过上限（例如单条消息过大），会返回 `400`。
-
-## 本地开发
-
-```bash
-cp .dev.vars.example .dev.vars
-# 编辑 .dev.vars，填入你的密钥
-# 可选：设置 RSP4COPILOT_DEBUG=true 开启详细日志
-
-npm run dev
-```
-
-## curl 测试
-
-```bash
-# 测试连接
-curl -sS -H "Authorization: Bearer <WORKER_AUTH_KEY>" \
-  https://<your-worker>.workers.dev/v1/models
-
-# 测试 OpenAI 模型
-curl -sS -H "Authorization: Bearer <WORKER_AUTH_KEY>" \
-  -H "Content-Type: application/json" \
-  https://<your-worker>.workers.dev/v1/chat/completions \
-  -d '{"model":"gpt-5.2","messages":[{"role":"user","content":"hello"}]}'
-
-# 测试 Gemini 模型
-curl -sS -H "Authorization: Bearer <WORKER_AUTH_KEY>" \
-  -H "Content-Type: application/json" \
-  https://<your-worker>.workers.dev/v1/chat/completions \
-  -d '{"model":"gemini-3-flash-preview","stream":true,"messages":[{"role":"user","content":"hello"}]}'
-
-# 测试 Claude 模型
-curl -sS -H "Authorization: Bearer <WORKER_AUTH_KEY>" \
-  -H "Content-Type: application/json" \
-  https://<your-worker>.workers.dev/v1/chat/completions \
-  -d '{"model":"claude-sonnet-4-5-20250929","stream":true,"messages":[{"role":"user","content":"hello"}]}'
-```
-
-## 调试
-
-```bash
-# 1) 开启调试日志：在 wrangler.toml 的 [vars] 里设置
-# RSP4COPILOT_DEBUG = "true"
-# 然后重新部署
-npm run deploy
-
-# 2) 终端 1：查看日志（需要 Cloudflare 登录态）
-npx wrangler tail rsp4copilot
-
-# 3) 终端 2：发送请求（无需额外 header）
-curl -sS -H "Authorization: Bearer <WORKER_AUTH_KEY>" \
-  -H "Content-Type: application/json" \
-  https://<your-worker>.workers.dev/v1/chat/completions \
-  -d '{"model":"gpt-5.2","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## License
-
-MIT
+如果未提供 `RSP4COPILOT_CONFIG`，则仅对 `POST /v1/chat/completions` 保持旧的「按模型名前缀」路由逻辑（`gemini-*` / `claude-*` / 其他 -> OpenAI Responses），并继续使用旧的 `OPENAI_BASE_URL`/`GEMINI_BASE_URL`/`CLAUDE_BASE_URL` 等环境变量。

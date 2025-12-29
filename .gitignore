@@ -4,5 +4,8 @@ dist/
 *.log
 .dev.vars
 wrangler.toml
-tsconfig.json
 oai-compatible-copilot/
+configs/*.jsonc
+!configs/*.example.jsonc
+configs/*.json
+!configs/*.example.json

@@ -3,30 +3,17 @@
 #   cp .dev.vars.example .dev.vars
 #
 # Wrangler will load these when you run `wrangler dev`.
-#
 # NOTE: `.dev.vars` is ignored by git. Do NOT commit real secrets.
 #
-# NOTE: This project is designed for relay servers (e.g. Claude Relay Server),
-#       NOT for direct official API connections.
-#
 
-# Upstream (Responses API) - use your relay server URL
-# OPENAI_BASE_URL=https://your-relay-server.example/openai
-# RESP_RESPONSES_PATH=/v1/responses
-# RESP_REASONING_EFFORT=low
-# # (default is low; set to "off" to not send reasoning params)
+# Worker-side auth (required)
+# WORKER_AUTH_KEY=your-worker-auth-key
+# Optional: multiple client auth keys (comma-separated)
+# WORKER_AUTH_KEYS=key1,key2,key3
 
-# Optional: Gemini upstream - use your relay server URL
-# GEMINI_BASE_URL=https://your-relay-server.example/gemini
-# GEMINI_API_KEY=...
-# GEMINI_DEFAULT_MODEL=gemini-3-pro-preview
-
-# Optional: Claude upstream - use your relay server URL
-# CLAUDE_BASE_URL=https://your-relay-server.example/api
-# CLAUDE_API_KEY=...
-# CLAUDE_DEFAULT_MODEL=claude-sonnet-4-5-20250929
-# CLAUDE_MESSAGES_PATH=/messages
-# CLAUDE_MAX_TOKENS=8192
+# Config-driven routing (required for multi-protocol mode)
+# One-line JSON is easiest for .dev.vars; for production prefer the multi-line TOML string in `wrangler.toml.example`.
+RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"type":"openai-responses","baseURL":"https://your-relay.example/openai","apiKey":"REPLACE_ME","models":{"gpt-5.2":{"upstreamModel":"gpt-5.2"}}}}}
 
 # Debug logging
 # RSP4COPILOT_DEBUG=true
@@ -36,12 +23,12 @@
 # RSP4COPILOT_MAX_MESSAGES=200
 # RSP4COPILOT_MAX_INPUT_CHARS=300000
 
-# For local dev only you can put secrets here (Cloudflare recommends using `wrangler secret put` for production):
-# OPENAI_API_KEY=sk-...
-# WORKER_AUTH_KEY=your-worker-auth-key
-# Optional: multiple client auth keys (comma-separated)
-# WORKER_AUTH_KEYS=key1,key2,key3
-
-# Model listing for /v1/models
-DEFAULT_MODEL=gpt-5.2
-ADAPTER_MODELS=gpt-5.1,gpt-5.1-codex-max,gpt-5.2,gpt-5.2-codex,gemini-3-flash-preview,gemini-3-pro-preview,claude-haiku-4-5-20251001,claude-sonnet-4-5-20250929,claude-opus-4-5-20251101
+# --- Legacy (optional) ---
+# If you don't set RSP4COPILOT_CONFIG, only `/v1/chat/completions` keeps the old prefix routing,
+# and these upstream env vars are used instead:
+# OPENAI_BASE_URL=https://your-relay.example/openai
+# OPENAI_API_KEY=...
+# GEMINI_BASE_URL=https://your-relay.example/gemini
+# GEMINI_API_KEY=...
+# CLAUDE_BASE_URL=https://your-relay.example/api
+# CLAUDE_API_KEY=...

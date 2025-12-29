@@ -15,7 +15,7 @@ import {
   safeJsonStringifyForLog,
   sseHeaders,
   trimOpenAIChatMessages,
-} from "../common.js";
+} from "../common";
 
 export function isClaudeModelId(modelId) {
   const v = typeof modelId === "string" ? modelId.trim().toLowerCase() : "";
@@ -274,7 +274,7 @@ export async function handleClaudeChatCompletions({ env, reqJson, model, stream,
       stream,
       messagesCount: claudeMessages.length,
       hasSystem: !!claudeSystem,
-      systemLen: typeof claudeSystem === "string" ? claudeSystem.length : 0,
+      systemLen: Array.isArray(claudeSystem) ? claudeSystem.length : 0,
       toolsCount: claudeTools.length,
       reqToolsCount: Array.isArray(reqJson.tools) ? reqJson.tools.length : 0,
     });
@@ -286,7 +286,7 @@ export async function handleClaudeChatCompletions({ env, reqJson, model, stream,
   if (Number.isInteger(reqJson.max_completion_tokens)) maxTokens = reqJson.max_completion_tokens;
   if (maxTokensCap > 0 && maxTokens > maxTokensCap) maxTokens = maxTokensCap;
 
-  const claudeBody = {
+  const claudeBody: any = {
     model: claudeModel,
     messages: claudeMessages,
     max_tokens: maxTokens,
@@ -375,7 +375,7 @@ export async function handleClaudeChatCompletions({ env, reqJson, model, stream,
       });
     }
 
-    const message = { role: "assistant", content: text || null };
+    const message: any = { role: "assistant", content: text || null };
     if (toolCalls.length) message.tool_calls = toolCalls;
 
     return jsonResponse(200, {

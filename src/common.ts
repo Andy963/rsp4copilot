@@ -1,3 +1,5 @@
+export type Env = Record<string, string | undefined>;
+
 export function jsonResponse(status, obj, extraHeaders = undefined) {
   const headers = {
     "content-type": "application/json; charset=utf-8",
@@ -69,7 +71,7 @@ export function measureOpenAIChatMessages(messages) {
   return { turns, messages: list.length, inputChars };
 }
 
-export function trimOpenAIChatMessages(messages, limits) {
+export function trimOpenAIChatMessages(messages: any, limits: any): any {
   const list = Array.isArray(messages) ? messages : [];
 
   const maxTurns = Number.isFinite(limits?.maxTurns) ? limits.maxTurns : DEFAULT_RSP4COPILOT_MAX_TURNS;
@@ -422,7 +424,7 @@ export function normalizeToolCallsFromChatMessage(msg) {
                 return "{}";
               }
             })();
-    const item = { call_id: callId, name: toolName, arguments: argStr };
+    const item: any = { call_id: callId, name: toolName, arguments: argStr };
     if (typeof thoughtSignature === "string" && thoughtSignature.trim()) {
       item.thought_signature = thoughtSignature.trim();
     }

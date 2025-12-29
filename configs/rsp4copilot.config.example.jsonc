@@ -1,18 +1,12 @@
-name = "rsp4copilot"
-main = "src/workers.ts"
-compatibility_date = "2025-12-24"
-workers_dev = true
-preview_urls = true
-
-# Optional: Custom domain routing (uncomment and modify)
-# [[routes]]
-# pattern = "your-domain.com/*"
-# zone_name = "your-domain.com"
-
-[vars]
-# 推荐：使用单一 JSONC 配置（RSP4COPILOT_CONFIG）描述所有 provider/model。
-# `model` 支持短 ID（modelName）或完整 ID（providerId.modelName）；短 ID 有歧义时再用完整 ID。
-RSP4COPILOT_CONFIG = '''
+// Example config for `RSP4COPILOT_CONFIG` (JSONC allowed).
+//
+// How to use:
+// - Local dev: copy-paste this JSONC into `.dev.vars` as `RSP4COPILOT_CONFIG=...`
+// - Cloudflare: set Worker variable `RSP4COPILOT_CONFIG` to the JSONC string (Dashboard or `wrangler secret put`)
+//
+// IMPORTANT:
+// - `baseURL` is the *upstream* API base (NOT this Worker’s public URL).
+// - Do NOT point `baseURL` to the same Worker domain/path, otherwise you'll create a proxy loop.
 {
   "version": 1,
   "providers": {
@@ -48,25 +42,3 @@ RSP4COPILOT_CONFIG = '''
     }
   }
 }
-'''
-
-# Debug logging (optional)
-# RSP4COPILOT_DEBUG = "true"
-
-# Chat history limits (optional; defaults shown; set 0 to disable)
-# RSP4COPILOT_MAX_TURNS = 40
-# RSP4COPILOT_MAX_MESSAGES = 200
-# RSP4COPILOT_MAX_INPUT_CHARS = 300000
-
-# Secrets (do not commit to git, use wrangler secret put):
-#   wrangler secret put WORKER_AUTH_KEY
-# Optional: multiple client auth keys (comma-separated):
-#   wrangler secret put WORKER_AUTH_KEYS
-#
-# Upstream provider keys:
-#   wrangler secret put OPENAI_API_KEY
-#   wrangler secret put GEMINI_API_KEY
-#   wrangler secret put CLAUDE_API_KEY
-
-[observability]
-enabled = true

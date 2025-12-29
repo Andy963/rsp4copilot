@@ -20,7 +20,24 @@ import {
   sha256Hex,
   sseHeaders,
   trimOpenAIChatMessages,
-} from "../common.js";
+} from "../common";
+
+function normalizeDuplicateV1Segments(path: unknown): string {
+  let p = typeof path === "string" ? path : path == null ? "" : String(path);
+  if (!p) return p;
+
+  // Normalize accidental double slashes first.
+  p = p.replace(/\/{2,}/g, "/");
+
+  // Collapse consecutive `/v1` segments (e.g. `/openai/v1/v1/responses` -> `/openai/v1/responses`).
+  for (let i = 0; i < 6; i++) {
+    const next = p.replace(/\/v1\/+v1(\/|$)/g, "/v1$1");
+    if (next === p) break;
+    p = next;
+  }
+
+  return p;
+}
 
 function buildUpstreamUrls(raw, responsesPathRaw) {
   const value = (raw || "").trim();
@@ -51,41 +68,142 @@ function buildUpstreamUrls(raw, responsesPathRaw) {
     try {
       const normalized = normalizeBaseUrl(p);
       const u0 = new URL(normalized);
-      const basePath = (u0.pathname || "").replace(/\/+$/, "") || "/";
-      const isFullEndpoint = basePath.endsWith("/v1/responses") || basePath.endsWith("/responses");
+      const rawPath = (u0.pathname || "").replace(/\/+$/, "") || "/";
+      const base0 = normalizeDuplicateV1Segments(rawPath);
 
-      if (isFullEndpoint) {
-        u0.pathname = basePath;
-        u0.search = "";
-        u0.hash = "";
-        pushUrl(u0.toString());
-        continue;
+      const basePathsSet = new Set<string>();
+      const pushBase = (bp) => {
+        const v = normalizeDuplicateV1Segments((bp || "").replace(/\/+$/, "") || "/");
+        if (!v) return;
+        basePathsSet.add(v);
+      };
+
+      // Accept both "base URL" and "full endpoint" inputs, and generate safe fallbacks.
+      pushBase(base0);
+      if (base0.endsWith("/responses")) pushBase(base0.replace(/\/responses$/, "") || "/");
+      for (const bp of Array.from(basePathsSet)) {
+        if (bp.endsWith("/v1")) pushBase(bp.replace(/\/v1$/, "") || "/");
       }
 
-      // Treat as base/prefix: append responses path.
-      const preferred = configuredResponsesPath
-        ? configuredResponsesPath.startsWith("/")
-          ? configuredResponsesPath
-          : `/${configuredResponsesPath}`
-        : inferResponsesPath(basePath);
-      const candidatesRaw = [
-        joinPathPrefix(basePath, preferred),
-        joinPathPrefix(basePath, "/v1/responses"),
-        joinPathPrefix(basePath, "/responses"),
-      ];
-      const candidates = candidatesRaw
-        .filter((path) => !String(path || "").includes("/v1/v1/responses"))
-        .sort((a, b) => {
-          const score = (p) => (String(p || "").includes("/v1/responses") ? 0 : 1);
-          return score(a) - score(b);
-        });
+      for (const basePath of Array.from(basePathsSet)) {
+        const isFullEndpoint = basePath.endsWith("/v1/responses") || basePath.endsWith("/responses");
 
-      for (const path of candidates) {
-        const u = new URL(normalized);
-        u.pathname = path;
-        u.search = "";
-        u.hash = "";
-        pushUrl(u.toString());
+        if (isFullEndpoint) {
+          const u = new URL(normalized);
+          u.pathname = basePath;
+          u.search = "";
+          u.hash = "";
+          pushUrl(u.toString());
+          continue;
+        }
+
+        // Treat as base/prefix: append responses path.
+        const preferred = configuredResponsesPath
+          ? configuredResponsesPath.startsWith("/")
+            ? configuredResponsesPath
+            : `/${configuredResponsesPath}`
+          : inferResponsesPath(basePath);
+        const candidatesRaw = [
+          joinPathPrefix(basePath, preferred),
+          joinPathPrefix(basePath, "/v1/responses"),
+          joinPathPrefix(basePath, "/responses"),
+        ];
+        const candidates = candidatesRaw
+          .map((p) => normalizeDuplicateV1Segments(p))
+          .filter((path) => !String(path || "").includes("/v1/v1/responses"))
+          .sort((a, b) => {
+            const score = (p) => (String(p || "").includes("/v1/responses") ? 0 : 1);
+            return score(a) - score(b);
+          });
+
+        for (const path of candidates) {
+          const u = new URL(normalized);
+          u.pathname = path;
+          u.search = "";
+          u.hash = "";
+          pushUrl(u.toString());
+        }
+      }
+    } catch {
+      // Ignore invalid URLs; caller will handle empty list.
+    }
+  }
+
+  return out;
+}
+
+function buildChatCompletionsUrls(raw, chatPathRaw) {
+  const value = typeof raw === "string" ? raw.trim() : String(raw ?? "").trim();
+  if (!value) return [];
+
+  const configuredChatPath = typeof chatPathRaw === "string" ? chatPathRaw.trim() : "";
+
+  const parts = value
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const out = [];
+  const pushUrl = (urlStr) => {
+    if (!urlStr || typeof urlStr !== "string") return;
+    if (!out.includes(urlStr)) out.push(urlStr);
+  };
+
+  const inferChatPath = (basePath) => {
+    const p = (basePath || "").replace(/\/+$/, "");
+    if (p.endsWith("/openai") || p.endsWith("/openai/v1")) return "/chat/completions";
+    if (p.endsWith("/v1")) return "/chat/completions";
+    return "/v1/chat/completions";
+  };
+
+  for (const p of parts) {
+    try {
+      const normalized = normalizeBaseUrl(p);
+      const u0 = new URL(normalized);
+      const rawPath = (u0.pathname || "").replace(/\/+$/, "") || "/";
+      const base0 = normalizeDuplicateV1Segments(rawPath);
+
+      const basePathsSet = new Set<string>();
+      const pushBase = (bp) => {
+        const v = normalizeDuplicateV1Segments((bp || "").replace(/\/+$/, "") || "/");
+        if (!v) return;
+        basePathsSet.add(v);
+      };
+
+      pushBase(base0);
+      if (base0.endsWith("/chat/completions")) pushBase(base0.replace(/\/chat\/completions$/, "") || "/");
+      for (const bp of Array.from(basePathsSet)) {
+        if (bp.endsWith("/v1")) pushBase(bp.replace(/\/v1$/, "") || "/");
+      }
+
+      for (const basePath of Array.from(basePathsSet)) {
+        const isFullEndpoint = basePath.endsWith("/v1/chat/completions") || basePath.endsWith("/chat/completions");
+
+        if (isFullEndpoint) {
+          const u = new URL(normalized);
+          u.pathname = basePath;
+          u.search = "";
+          u.hash = "";
+          pushUrl(u.toString());
+          continue;
+        }
+
+        const preferred = configuredChatPath
+          ? configuredChatPath.startsWith("/")
+            ? configuredChatPath
+            : `/${configuredChatPath}`
+          : inferChatPath(basePath);
+        const candidates = configuredChatPath
+          ? [joinPathPrefix(basePath, preferred)]
+          : [joinPathPrefix(basePath, preferred), joinPathPrefix(basePath, "/v1/chat/completions"), joinPathPrefix(basePath, "/chat/completions")];
+
+        for (const path of candidates) {
+          const u = new URL(normalized);
+          u.pathname = normalizeDuplicateV1Segments(path);
+          u.search = "";
+          u.hash = "";
+          pushUrl(u.toString());
+        }
       }
     } catch {
       // Ignore invalid URLs; caller will handle empty list.
@@ -238,7 +356,7 @@ function openaiToolsToResponsesTools(tools) {
           ? fn.parameters
           : null;
 
-    const tool = { type: "function", name };
+    const tool: any = { type: "function", name };
     if (typeof description === "string" && description.trim()) tool.description = description;
     if (parameters) tool.parameters = parameters;
     out.push(tool);
@@ -307,7 +425,7 @@ function chatMessagesToResponsesInput(messages) {
 
       const calls = normalizeToolCallsFromChatMessage(msg);
       for (const c of calls) {
-        const fcItem = {
+        const fcItem: any = {
           type: "function_call",
           id: `fc_${c.call_id}`,
           call_id: c.call_id,
@@ -926,9 +1044,10 @@ async function sessionCacheUrl(sessionKey) {
 
 async function getSessionPreviousResponseId(sessionKey) {
   try {
-    if (!sessionKey || typeof caches === "undefined" || !caches.default) return null;
+    const cache = !sessionKey || typeof caches === "undefined" ? null : ((caches as any).default ?? null);
+    if (!cache) return null;
     const url = await sessionCacheUrl(sessionKey);
-    const resp = await caches.default.match(url);
+    const resp = await cache.match(url);
     if (!resp) return null;
     const data = await resp.json().catch(() => null);
     const rid = data?.previous_response_id;
@@ -940,7 +1059,8 @@ async function getSessionPreviousResponseId(sessionKey) {
 
 async function setSessionPreviousResponseId(sessionKey, responseId) {
   try {
-    if (!sessionKey || !responseId || typeof caches === "undefined" || !caches.default) return;
+    const cache = !sessionKey || !responseId || typeof caches === "undefined" ? null : ((caches as any).default ?? null);
+    if (!cache) return;
     const url = await sessionCacheUrl(sessionKey);
     const req = new Request(url, { method: "GET" });
     const resp = new Response(JSON.stringify({ previous_response_id: responseId, updated_at: Date.now() }), {
@@ -949,7 +1069,7 @@ async function setSessionPreviousResponseId(sessionKey, responseId) {
         "cache-control": "max-age=86400",
       },
     });
-    await caches.default.put(req, resp);
+    await cache.put(req, resp);
   } catch {
     // ignore
   }
@@ -1058,7 +1178,7 @@ export async function handleOpenAIRequest({
     if (Number.isInteger(limits.maxInputChars) && limits.maxInputChars > 0 && promptText.length > limits.maxInputChars) {
       return jsonResponse(400, jsonError(`Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${limits.maxInputChars}; reduce prompt size or raise the limit`));
     }
-    const responsesReq = {
+    const responsesReq: any = {
       model,
       input: [{ role: "user", content: [{ type: "input_text", text: promptText }] }],
     };
@@ -1395,7 +1515,7 @@ export async function handleOpenAIRequest({
 
   const effectiveInstructions = appendInstructions(instructions, extraSystemText);
 
-  const fullReq = {
+  const fullReq: any = {
     model,
     input,
   };
@@ -1422,12 +1542,12 @@ export async function handleOpenAIRequest({
   const deltaMessages = prevId && lastAssistantIdx >= 0 ? messagesForUpstream.slice(lastAssistantIdx + 1) : [];
   const deltaConv = deltaMessages.length ? chatMessagesToResponsesInput(deltaMessages) : { input: [] };
 
-  const prevReq =
+  const prevReq: any =
     prevId && Array.isArray(deltaConv.input) && deltaConv.input.length
       ? {
           model,
           input: deltaConv.input,
-      previous_response_id: prevId,
+          previous_response_id: prevId,
         }
       : null;
   if (prevReq) {
@@ -1709,7 +1829,7 @@ export async function handleOpenAIRequest({
     const emitToolCallDelta = async (callId, name, argsDelta) => {
       const id = typeof callId === "string" ? callId.trim() : "";
       if (!id) return;
-      const fn = {};
+      const fn: any = {};
       if (typeof name === "string" && name.trim()) fn.name = name.trim();
       if (typeof argsDelta === "string" && argsDelta) fn.arguments = argsDelta;
       if (!("name" in fn) && !("arguments" in fn)) return;
@@ -2011,4 +2131,67 @@ export async function handleOpenAIRequest({
 
   if (debug) logDebug(debug, reqId, "request done", { elapsedMs: Date.now() - startedAt });
   return new Response(readable, { status: 200, headers: sseHeaders() });
+}
+
+export async function handleOpenAIChatCompletionsUpstream({
+  request,
+  env,
+  reqJson,
+  model,
+  stream,
+  token,
+  debug,
+  reqId,
+  path,
+  startedAt,
+  extraSystemText,
+}) {
+  const upstreamBase = normalizeAuthValue(env?.OPENAI_BASE_URL);
+  if (!upstreamBase) return jsonResponse(500, jsonError("Server misconfigured: missing OPENAI_BASE_URL", "server_error"));
+  const upstreamKey = normalizeAuthValue(env?.OPENAI_API_KEY);
+  if (!upstreamKey) return jsonResponse(500, jsonError("Server misconfigured: missing OPENAI_API_KEY", "server_error"));
+
+  const upstreamUrls = buildChatCompletionsUrls(upstreamBase, env?.OPENAI_CHAT_COMPLETIONS_PATH);
+  if (!upstreamUrls.length) return jsonResponse(500, jsonError("Server misconfigured: invalid OPENAI_BASE_URL", "server_error"));
+  if (debug) logDebug(debug, reqId, "openai chat-completions upstream urls", { urls: upstreamUrls });
+
+  const body = { ...(reqJson && typeof reqJson === "object" ? reqJson : {}) };
+  body.model = model;
+  body.stream = Boolean(stream);
+  for (const k of Object.keys(body)) {
+    if (k.startsWith("__")) delete body[k];
+  }
+
+  const headers = {
+    "content-type": "application/json",
+    accept: stream ? "text/event-stream" : "application/json",
+    authorization: `Bearer ${upstreamKey}`,
+    "x-api-key": upstreamKey,
+    "x-goog-api-key": upstreamKey,
+  };
+  if (debug) logDebug(debug, reqId, "openai chat-completions upstream headers", { headers: redactHeadersForLog(headers) });
+
+  if (extraSystemText && Array.isArray(body.messages)) {
+    body.messages = [{ role: "system", content: extraSystemText }, ...body.messages];
+  }
+
+  void token;
+  void request;
+  void path;
+  void startedAt;
+
+  const sel = await selectUpstreamResponseAny(upstreamUrls, headers, [body], debug, reqId);
+  if (!sel.ok && debug) {
+    logDebug(debug, reqId, "openai chat-completions upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
+  }
+  if (!sel.ok) return jsonResponse(sel.status, sel.error);
+
+  const resp = sel.resp;
+  if (stream) {
+    return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
+  }
+
+  const text = await resp.text();
+  const outHeaders = { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" };
+  return new Response(text, { status: resp.status, headers: outHeaders });
 }
