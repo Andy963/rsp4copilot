@@ -112,11 +112,10 @@ export async function dispatchOpenAIChatToProvider({
     });
 
     // Some upstream relays only support Chat Completions (no `/responses` route).
-    // Fall back automatically for common "wrong path" statuses.
+    // Fall back automatically for common "wrong path" statuses (avoid masking auth/permission errors like 403).
     if (
       !resp.ok &&
       (resp.status === 400 ||
-        resp.status === 403 ||
         resp.status === 404 ||
         resp.status === 405 ||
         resp.status === 422 ||

@@ -44,6 +44,7 @@ function buildUpstreamUrls(raw, responsesPathRaw) {
   if (!value) return [];
 
   const configuredResponsesPath = (responsesPathRaw || "").trim();
+  const hasConfiguredResponsesPath = Boolean(configuredResponsesPath);
 
   const parts = value
     .split(",")
@@ -98,20 +99,22 @@ function buildUpstreamUrls(raw, responsesPathRaw) {
         }
 
         // Treat as base/prefix: append responses path.
-        const preferred = configuredResponsesPath
+        // If a configured responses path is provided, treat it as authoritative (avoid overriding it with inferred fallbacks).
+        const preferred = hasConfiguredResponsesPath
           ? configuredResponsesPath.startsWith("/")
             ? configuredResponsesPath
             : `/${configuredResponsesPath}`
           : inferResponsesPath(basePath);
-        const candidatesRaw = [
-          joinPathPrefix(basePath, preferred),
-          joinPathPrefix(basePath, "/v1/responses"),
-          joinPathPrefix(basePath, "/responses"),
-        ];
+
+        const candidatesRaw = hasConfiguredResponsesPath
+          ? [joinPathPrefix(basePath, preferred)]
+          : [joinPathPrefix(basePath, preferred), joinPathPrefix(basePath, "/v1/responses"), joinPathPrefix(basePath, "/responses")];
+
         const candidates = candidatesRaw
           .map((p) => normalizeDuplicateV1Segments(p))
           .filter((path) => !String(path || "").includes("/v1/v1/responses"))
           .sort((a, b) => {
+            if (hasConfiguredResponsesPath) return 0;
             const score = (p) => (String(p || "").includes("/v1/responses") ? 0 : 1);
             return score(a) - score(b);
           });
@@ -463,8 +466,37 @@ function chatMessagesToResponsesInput(messages) {
   return { instructions: instructions || null, input: inputItems };
 }
 
-function shouldRetryUpstream(status) {
-  return status === 400 || status === 422;
+function shouldRetryUpstream(status, bodyText = "") {
+  // Only retry variants for likely "payload/shape mismatch" errors.
+  // Avoid spamming many retries for path/auth errors that some relays report as 400/422.
+  if (status !== 400 && status !== 422) return false;
+
+  const text = typeof bodyText === "string" ? bodyText : bodyText == null ? "" : String(bodyText);
+  if (!text.trim()) return true;
+
+  const t = text.toLowerCase();
+  const has = (s) => t.includes(s);
+
+  // Path/routing style errors (seen in some gateways).
+  if (has("no static resource")) return false;
+  if (has("unknown route")) return false;
+  if (has("route ") && has(" not found")) return false;
+  if (has("method not allowed")) return false;
+  if (has("not found")) return false;
+
+  // Auth/permission errors (variants won't help).
+  if (has("invalid api key")) return false;
+  if (has("api key format")) return false;
+  if (has("missing api key")) return false;
+  if (has("unauthorized")) return false;
+  if (has("forbidden")) return false;
+
+  // Model not found errors (variants won't help).
+  if (has("model_not_found")) return false;
+  if (has("does not exist")) return false;
+  if (has("unknown model")) return false;
+
+  return true;
 }
 
 function responsesReqToPrompt(responsesReq) {
@@ -919,8 +951,8 @@ async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = fa
       lastStatus = resp.status;
       lastText = await resp.text().catch(() => "");
       if (!firstErr) firstErr = { status: resp.status, text: lastText };
-      if (shouldRetryUpstream(resp.status) && i + 1 < variants.length) continue;
-      exhaustedRetryable = shouldRetryUpstream(resp.status) && i + 1 >= variants.length;
+      if (shouldRetryUpstream(resp.status, lastText) && i + 1 < variants.length) continue;
+      exhaustedRetryable = shouldRetryUpstream(resp.status, lastText) && i + 1 >= variants.length;
       try {
         const errText = exhaustedRetryable && firstErr ? firstErr.text : lastText;
         const errJson = JSON.parse(errText);
