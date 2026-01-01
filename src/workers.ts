@@ -14,7 +14,7 @@
  */
 
 import type { Env } from "./common";
-import { bearerToken, getWorkerAuthKeys, isDebugEnabled, jsonError, jsonResponse, logDebug, normalizeAuthValue, previewString } from "./common";
+import { bearerToken, getWorkerAuthKeys, isDebugEnabled, jsonError, jsonResponse, logDebug, normalizeAuthValue, previewString, sseHeaders } from "./common";
 import { claudeMessagesRequestToOpenaiChat, handleClaudeCountTokens, openaiChatResponseToClaudeMessage, openaiStreamToClaudeMessagesSse } from "./claude_api";
 import { getProviderApiKey, parseGatewayConfig } from "./config";
 import { dispatchOpenAIChatToProvider } from "./dispatch";
@@ -22,7 +22,7 @@ import { resolveModel } from "./model_resolver";
 import { geminiModelsList, openaiModelsList } from "./models_list";
 import { handleClaudeChatCompletions, isClaudeModelId } from "./providers/claude";
 import { handleGeminiChatCompletions, isGeminiModelId } from "./providers/gemini";
-import { handleOpenAIRequest } from "./providers/openai";
+import { handleOpenAIRequest, handleOpenAIResponsesUpstream } from "./providers/openai";
 import { geminiRequestToOpenAIChat, openAIChatResponseToGemini } from "./protocols/gemini";
 import { openAIChatResponseToResponses, responsesRequestToOpenAIChat } from "./protocols/responses";
 import { openAIChatSseToGeminiSse, openAIChatSseToResponsesSse } from "./protocols/stream";
@@ -291,9 +291,57 @@ export default {
         const resolved = resolveModel(gatewayCfg.config, respReq.model, providerHint);
         if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
 
+        const stream = Boolean(respReq.stream);
+        const modelId = typeof respReq.model === "string" ? respReq.model : "";
+        const providerType = typeof resolved.provider.type === "string" ? resolved.provider.type.trim() : "";
+
+        // If the upstream is also OpenAI Responses, proxy it directly to preserve multimodal outputs (e.g. images).
+        if (providerType === "openai-responses") {
+          const apiKey = getProviderApiKey(env, resolved.provider);
+          if (!apiKey) {
+            return withCors(
+              jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${resolved.provider.id}`, "server_error")),
+              corsHeaders,
+            );
+          }
+          const responsesPath =
+            (resolved.provider.endpoints &&
+              typeof (resolved.provider.endpoints as any).responsesPath === "string" &&
+              String((resolved.provider.endpoints as any).responsesPath).trim()) ||
+            (resolved.provider.endpoints &&
+              typeof (resolved.provider.endpoints as any).responses_path === "string" &&
+              String((resolved.provider.endpoints as any).responses_path).trim()) ||
+            "";
+
+          const modelOpts = resolved.model?.options || {};
+          const reasoningEffort = typeof (modelOpts as any).reasoningEffort === "string" ? String((modelOpts as any).reasoningEffort).trim() : "";
+
+          const env2: Env = {
+            ...env,
+            OPENAI_BASE_URL: joinUrls(resolved.provider.baseURLs),
+            OPENAI_API_KEY: apiKey,
+            ...(responsesPath ? { RESP_RESPONSES_PATH: responsesPath } : null),
+            ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
+          };
+
+          const upstreamResp = await handleOpenAIResponsesUpstream({
+            request,
+            env: env2,
+            reqJson: respReq,
+            upstreamModel: resolved.model.upstreamModel,
+            outModel: modelId,
+            stream,
+            token,
+            debug,
+            reqId,
+            path,
+            startedAt,
+          });
+          return withCors(upstreamResp, corsHeaders);
+        }
+
         const openaiReq = responsesRequestToOpenAIChat(respReq) as any;
         openaiReq.model = resolved.model.upstreamModel;
-        const stream = Boolean(respReq.stream);
         openaiReq.stream = stream;
 
         const openaiResp = await dispatchOpenAIChatToProvider({
@@ -313,11 +361,9 @@ export default {
         });
         if (!openaiResp.ok) return withCors(openaiResp, corsHeaders);
 
-        const modelId = typeof respReq.model === "string" ? respReq.model : "";
-
         if (stream) {
           const body = openAIChatSseToResponsesSse(openaiResp, modelId);
-          return withCors(new Response(body, { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } }), corsHeaders);
+          return withCors(new Response(body, { status: 200, headers: sseHeaders() }), corsHeaders);
         }
 
         const openaiJson = await openaiResp.json().catch(() => null);
