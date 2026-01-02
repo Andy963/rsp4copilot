@@ -663,6 +663,272 @@ function responsesReqVariants(responsesReq, stream) {
   return deduped;
 }
 
+function safeJsonLen(value) {
+  try {
+    const s = JSON.stringify(value);
+    return typeof s === "string" ? s.length : String(s ?? "").length;
+  } catch {
+    return String(value ?? "").length;
+  }
+}
+
+function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
+  const limit = Number.isInteger(maxChars) ? maxChars : Number.isFinite(maxChars) ? Math.trunc(maxChars) : 0;
+  const beforeLen = safeJsonLen(req);
+  if (!(limit > 0) || beforeLen <= limit) {
+    return {
+      ok: true,
+      trimmed: false,
+      beforeLen,
+      afterLen: beforeLen,
+      droppedTurns: 0,
+      droppedSystem: 0,
+      droppedTail: 0,
+      truncatedInputChars: 0,
+      truncatedInstructionChars: 0,
+      droppedTools: false,
+    };
+  }
+
+  if (!req || typeof req !== "object") {
+    return { ok: false, error: `Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${limit}; reduce prompt size or raise the limit`, beforeLen };
+  }
+
+  let trimmed = false;
+  let droppedTurns = 0;
+  let droppedSystem = 0;
+  let droppedTail = 0;
+  let truncatedInputChars = 0;
+  let truncatedInstructionChars = 0;
+  let droppedTools = false;
+
+  const roleOf = (item) => (item && typeof item === "object" && typeof item.role === "string" ? item.role.trim().toLowerCase() : "");
+  const isSystemRole = (role) => role === "system" || role === "developer";
+
+  const truncateStringFieldToFit = (parentObj, key, maxLen) => {
+    if (!parentObj || typeof parentObj !== "object") return 0;
+    const raw = parentObj[key];
+    if (typeof raw !== "string") return 0;
+
+    // Keep the tail of the string (often contains the actual user question).
+    let lo = 0;
+    let hi = raw.length;
+    const original = raw;
+
+    // Fast path: try empty string first (if even this doesn't fit, caller must try other fields).
+    parentObj[key] = "";
+    if (safeJsonLen(req) > maxLen) {
+      parentObj[key] = original;
+      return 0;
+    }
+
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi + 1) / 2);
+      parentObj[key] = original.slice(-mid);
+      if (safeJsonLen(req) <= maxLen) lo = mid;
+      else hi = mid - 1;
+    }
+
+    parentObj[key] = original.slice(-lo);
+    return original.length - lo;
+  };
+
+  const tryTrimInputWindow = () => {
+    if (!Array.isArray(req.input) || req.input.length <= 1) return false;
+
+    const input = req.input;
+
+    const baseLen = safeJsonLen({ ...req, input: [] });
+    if (baseLen > limit) return false;
+
+    const lens = input.map((it) => safeJsonLen(it));
+    const prefixSum = new Array(lens.length + 1);
+    prefixSum[0] = 0;
+    for (let i = 0; i < lens.length; i++) prefixSum[i + 1] = prefixSum[i] + lens[i];
+
+    let systemPrefixEnd = 0;
+    while (systemPrefixEnd < input.length && isSystemRole(roleOf(input[systemPrefixEnd]))) systemPrefixEnd++;
+
+    const userIdxs = [];
+    for (let i = systemPrefixEnd; i < input.length; i++) {
+      if (roleOf(input[i]) === "user") userIdxs.push(i);
+    }
+    const lastUserIdx = userIdxs.length ? userIdxs[userIdxs.length - 1] : -1;
+
+    let sysStart = 0;
+    let restStart = systemPrefixEnd;
+    let restEnd = input.length;
+
+    const selectedCount = () => (systemPrefixEnd - sysStart) + (restEnd - restStart);
+    const selectedLensSum = () => (prefixSum[systemPrefixEnd] - prefixSum[sysStart]) + (prefixSum[restEnd] - prefixSum[restStart]);
+    const selectedLen = () => {
+      const count = selectedCount();
+      const commas = count > 1 ? count - 1 : 0;
+      return baseLen + selectedLensSum() + commas;
+    };
+
+    const advanceRestStart = () => {
+      if (restStart >= restEnd) return false;
+
+      // Drop any prelude before the first user item.
+      if (userIdxs.length && restStart < userIdxs[0]) {
+        restStart = userIdxs[0];
+        return true;
+      }
+
+      let next = -1;
+      for (const u of userIdxs) {
+        if (u > restStart) {
+          next = u;
+          break;
+        }
+      }
+
+      // Refuse to drop the last user turn (must keep the latest user input).
+      if (lastUserIdx >= 0 && (next < 0 || next > lastUserIdx)) return false;
+
+      if (next >= 0) {
+        restStart = next;
+        return true;
+      }
+
+      // No user messages: drop everything.
+      restStart = restEnd;
+      return true;
+    };
+
+    const dropTailOnce = () => {
+      if (restEnd <= restStart) return false;
+      const mustKeep = lastUserIdx >= 0 ? lastUserIdx + 1 : restStart + 1;
+      const minEnd = Math.max(restStart + 1, mustKeep);
+      if (restEnd <= minEnd) return false;
+      restEnd--;
+      return true;
+    };
+
+    let changed = false;
+    while (selectedLen() > limit) {
+      if (advanceRestStart()) {
+        droppedTurns++;
+        changed = true;
+        continue;
+      }
+      if (sysStart < systemPrefixEnd) {
+        sysStart++;
+        droppedSystem++;
+        changed = true;
+        continue;
+      }
+      if (dropTailOnce()) {
+        droppedTail++;
+        changed = true;
+        continue;
+      }
+      break;
+    }
+
+    if (!changed) return false;
+    req.input = [...input.slice(sysStart, systemPrefixEnd), ...input.slice(restStart, restEnd)];
+    return true;
+  };
+
+  const tryTruncateLargestInputText = () => {
+    if (!Array.isArray(req.input)) return false;
+
+    // Clone input tree before mutating any nested text fields (variants may share item object references).
+    req.input = req.input.map((item) => {
+      if (!item || typeof item !== "object") return item;
+      const cloned = { ...item };
+      if (Array.isArray(item.content)) {
+        cloned.content = item.content.map((part) => (part && typeof part === "object" ? { ...part } : part));
+      }
+      return cloned;
+    });
+
+    let best = null;
+    for (const item of req.input) {
+      if (!item || typeof item !== "object") continue;
+      const r = roleOf(item);
+      if (r && r !== "user" && r !== "system" && r !== "developer") continue;
+
+      const content = item.content;
+      if (typeof content === "string") {
+        if (!best || content.length > best.len) best = { obj: item, key: "content", len: content.length };
+      } else if (Array.isArray(content)) {
+        for (const part of content) {
+          if (!part || typeof part !== "object") continue;
+          if (typeof part.text === "string") {
+            const t = part.text;
+            if (!best || t.length > best.len) best = { obj: part, key: "text", len: t.length };
+          }
+        }
+      }
+    }
+
+    if (!best || best.len <= 0) return false;
+    const cut = truncateStringFieldToFit(best.obj, best.key, limit);
+    if (cut <= 0) return false;
+    truncatedInputChars += cut;
+    return true;
+  };
+
+  const tryTruncateInstructions = () => {
+    if (typeof req.instructions !== "string" || !req.instructions) return false;
+    const cut = truncateStringFieldToFit(req, "instructions", limit);
+    if (cut <= 0) return false;
+    truncatedInstructionChars += cut;
+    return true;
+  };
+
+  const tryDropTools = () => {
+    if (!("tools" in req)) return false;
+    if (req.tools == null) return false;
+    delete req.tools;
+    droppedTools = true;
+    return true;
+  };
+
+  // Iteratively shrink: drop old turns first, then truncate huge text fields, then drop tools as a last resort.
+  let guard = 0;
+  while (safeJsonLen(req) > limit && guard++ < 12) {
+    if (tryTrimInputWindow()) {
+      trimmed = true;
+      continue;
+    }
+    if (tryTruncateLargestInputText()) {
+      trimmed = true;
+      continue;
+    }
+    if (tryTruncateInstructions()) {
+      trimmed = true;
+      continue;
+    }
+    if (tryDropTools()) {
+      trimmed = true;
+      continue;
+    }
+    break;
+  }
+
+  const afterLen = safeJsonLen(req);
+  if (afterLen > limit) {
+    return { ok: false, error: `Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${limit}; reduce prompt size or raise the limit`, beforeLen, afterLen };
+  }
+
+  return {
+    ok: true,
+    trimmed: trimmed || afterLen !== beforeLen,
+    beforeLen,
+    afterLen,
+    droppedTurns,
+    droppedSystem,
+    droppedTail,
+    truncatedInputChars,
+    truncatedInstructionChars,
+    droppedTools,
+  };
+}
+
 function extractOutputTextFromResponsesResponse(response) {
   if (!response || typeof response !== "object") return "";
 
@@ -2258,6 +2524,8 @@ export async function handleOpenAIResponsesUpstream({
   const upstreamKey = normalizeAuthValue(env?.OPENAI_API_KEY);
   if (!upstreamKey) return jsonResponse(500, jsonError("Server misconfigured: missing OPENAI_API_KEY", "server_error"));
 
+  const limits = getRsp4CopilotLimits(env);
+
   const upstreamUrls = buildUpstreamUrls(upstreamBase, env?.RESP_RESPONSES_PATH);
   if (!upstreamUrls.length) return jsonResponse(500, jsonError("Server misconfigured: invalid OPENAI_BASE_URL", "server_error"));
   if (debug) logDebug(debug, reqId, "openai upstream urls", { urls: upstreamUrls });
@@ -2290,12 +2558,44 @@ export async function handleOpenAIResponsesUpstream({
     else bodyBase.reasoning = { effort: reasoningEffort };
   }
 
+  const maxInputChars = Number.isInteger(limits?.maxInputChars) ? limits.maxInputChars : null;
+  if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
+    const trimRes = trimOpenAIResponsesRequestToMaxChars(bodyBase, maxInputChars);
+    if (!trimRes.ok) return jsonResponse(400, jsonError(trimRes.error));
+    if (debug && trimRes.trimmed) {
+      logDebug(debug, reqId, "openai responses trimmed", {
+        beforeLen: trimRes.beforeLen,
+        afterLen: trimRes.afterLen,
+        droppedTurns: trimRes.droppedTurns,
+        droppedSystem: trimRes.droppedSystem,
+        droppedTail: trimRes.droppedTail,
+        truncatedInputChars: trimRes.truncatedInputChars,
+        truncatedInstructionChars: trimRes.truncatedInstructionChars,
+        droppedTools: trimRes.droppedTools,
+      });
+    }
+  }
+
   void token;
   void request;
   void path;
   void startedAt;
 
-  const variants = responsesReqVariants(bodyBase, upstreamStream);
+  const variants0 = responsesReqVariants(bodyBase, upstreamStream);
+  const variants = [];
+  if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
+    for (const v0 of variants0) {
+      if (!v0 || typeof v0 !== "object") continue;
+      const v = { ...v0 };
+      const t = trimOpenAIResponsesRequestToMaxChars(v, maxInputChars);
+      if (t.ok) variants.push(v);
+    }
+    if (!variants.length) {
+      return jsonResponse(400, jsonError(`Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${maxInputChars}; reduce prompt size or raise the limit`));
+    }
+  } else {
+    variants.push(...variants0);
+  }
   if (debug) {
     const reqLog = safeJsonStringifyForLog(bodyBase);
     logDebug(debug, reqId, "openai responses request", {
