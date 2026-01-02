@@ -186,10 +186,43 @@ function jsonSchemaToGeminiSchema(jsonSchema, rootSchema = jsonSchema, refStack 
   const schemaFieldNames = new Set(["items"]);
   const listSchemaFieldNames = new Set(["anyOf", "oneOf"]);
   const dictSchemaFieldNames = new Set(["properties"]);
+  const int64FieldNames = new Set(["maxItems", "minItems", "minLength", "maxLength", "minProperties", "maxProperties"]);
 
   const out: any = {};
 
   const input = { ...jsonSchema };
+
+  // Gemini Schema is a subset of OpenAPI 3.0 and does not support exclusiveMinimum/exclusiveMaximum.
+  // Convert JSON Schema 2019+/2020 numeric exclusives (and OpenAPI boolean exclusives) into inclusive bounds.
+  const typeHint = typeof input.type === "string" ? input.type.trim().toLowerCase() : "";
+  const isIntegerType = typeHint === "integer";
+  const bumpEpsilon = (n) => Number.EPSILON * Math.max(1, Math.abs(Number(n)));
+  const bumpUp = (n) => (isIntegerType ? Math.floor(Number(n)) + 1 : Number(n) + bumpEpsilon(n));
+  const bumpDown = (n) => (isIntegerType ? Math.ceil(Number(n)) - 1 : Number(n) - bumpEpsilon(n));
+
+  if (typeof input.exclusiveMinimum === "number" && Number.isFinite(input.exclusiveMinimum)) {
+    const candidate = bumpUp(input.exclusiveMinimum);
+    if (typeof input.minimum === "number" && Number.isFinite(input.minimum)) input.minimum = Math.max(input.minimum, candidate);
+    else input.minimum = candidate;
+    delete input.exclusiveMinimum;
+  } else if (input.exclusiveMinimum === true) {
+    if (typeof input.minimum === "number" && Number.isFinite(input.minimum)) input.minimum = bumpUp(input.minimum);
+    delete input.exclusiveMinimum;
+  } else if ("exclusiveMinimum" in input) {
+    delete input.exclusiveMinimum;
+  }
+
+  if (typeof input.exclusiveMaximum === "number" && Number.isFinite(input.exclusiveMaximum)) {
+    const candidate = bumpDown(input.exclusiveMaximum);
+    if (typeof input.maximum === "number" && Number.isFinite(input.maximum)) input.maximum = Math.min(input.maximum, candidate);
+    else input.maximum = candidate;
+    delete input.exclusiveMaximum;
+  } else if (input.exclusiveMaximum === true) {
+    if (typeof input.maximum === "number" && Number.isFinite(input.maximum)) input.maximum = bumpDown(input.maximum);
+    delete input.exclusiveMaximum;
+  } else if ("exclusiveMaximum" in input) {
+    delete input.exclusiveMaximum;
+  }
 
   if (input.type && input.anyOf) {
     // Avoid producing an invalid schema.
@@ -229,9 +262,7 @@ function jsonSchemaToGeminiSchema(jsonSchema, rootSchema = jsonSchema, refStack 
     if (k === "additionalProperties") continue;
     if (k === "definitions") continue;
     if (k === "$defs") continue;
-    if (k === "title") continue;
     if (k === "examples") continue;
-    if (k === "default") continue;
     if (k === "allOf") continue;
 
     if (k === "type") {
@@ -242,7 +273,7 @@ function jsonSchemaToGeminiSchema(jsonSchema, rootSchema = jsonSchema, refStack 
     }
 
     if (k === "const") {
-      if (!("enum" in out)) out.enum = [v];
+      if (!("enum" in out) && typeof v === "string") out.enum = [v];
       continue;
     }
 
@@ -278,8 +309,47 @@ function jsonSchemaToGeminiSchema(jsonSchema, rootSchema = jsonSchema, refStack 
       continue;
     }
 
-    // Pass through other supported JSON schema fields (description, enum, required, etc.).
-    out[k] = v;
+    if (k === "required" || k === "propertyOrdering") {
+      if (Array.isArray(v)) {
+        const list = v.filter((x) => typeof x === "string" && x.trim());
+        if (list.length) out[k] = list;
+      }
+      continue;
+    }
+
+    if (k === "enum") {
+      if (Array.isArray(v)) {
+        const list = v.filter((x) => typeof x === "string");
+        if (list.length) out.enum = list;
+      }
+      continue;
+    }
+
+    if (k === "format" || k === "title" || k === "description" || k === "pattern") {
+      if (typeof v === "string" && v.trim()) out[k] = v;
+      continue;
+    }
+
+    if (k === "nullable") {
+      if (typeof v === "boolean") out.nullable = v;
+      continue;
+    }
+
+    if (k === "minimum" || k === "maximum") {
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+      continue;
+    }
+
+    if (int64FieldNames.has(k)) {
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = String(Math.trunc(v));
+      else if (typeof v === "string" && v.trim()) out[k] = v.trim();
+      continue;
+    }
+
+    if (k === "default" || k === "example") {
+      out[k] = v;
+      continue;
+    }
   }
 
   // Gemini Schema types are enum-like uppercase strings; if absent but properties exist, treat as OBJECT.
