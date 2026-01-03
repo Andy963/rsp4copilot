@@ -687,6 +687,7 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
       truncatedInputChars: 0,
       truncatedInstructionChars: 0,
       droppedTools: false,
+      droppedUnpairedToolCalls: 0,
     };
   }
 
@@ -701,9 +702,47 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
   let truncatedInputChars = 0;
   let truncatedInstructionChars = 0;
   let droppedTools = false;
+  let droppedUnpairedToolCalls = 0;
 
   const roleOf = (item) => (item && typeof item === "object" && typeof item.role === "string" ? item.role.trim().toLowerCase() : "");
   const isSystemRole = (role) => role === "system" || role === "developer";
+  const inputItemTypeOf = (item) => (item && typeof item === "object" && typeof item.type === "string" ? item.type.trim() : "");
+  const callIdOf = (item) => {
+    if (!item || typeof item !== "object") return "";
+    const v = item.call_id ?? item.callId ?? item.id;
+    return typeof v === "string" ? v.trim() : "";
+  };
+
+  const sanitizeResponsesToolPairs = () => {
+    if (!Array.isArray(req.input) || req.input.length === 0) return 0;
+
+    const outputCallIds = new Set();
+    let sawFunctionCall = false;
+    for (const item of req.input) {
+      const t = inputItemTypeOf(item);
+      if (t === "function_call") sawFunctionCall = true;
+      if (t === "function_call_output") {
+        const id = callIdOf(item);
+        if (id) outputCallIds.add(id);
+      }
+    }
+    if (!sawFunctionCall) return 0;
+
+    let removed = 0;
+    const nextInput = [];
+    for (const item of req.input) {
+      const t = inputItemTypeOf(item);
+      if (t === "function_call") {
+        const id = callIdOf(item);
+        if (id && outputCallIds.has(id)) nextInput.push(item);
+        else removed++;
+        continue;
+      }
+      nextInput.push(item);
+    }
+    if (removed > 0) req.input = nextInput;
+    return removed;
+  };
 
   const truncateStringFieldToFit = (parentObj, key, maxLen) => {
     if (!parentObj || typeof parentObj !== "object") return 0;
@@ -829,6 +868,7 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
 
     if (!changed) return false;
     req.input = [...input.slice(sysStart, systemPrefixEnd), ...input.slice(restStart, restEnd)];
+    droppedUnpairedToolCalls += sanitizeResponsesToolPairs();
     return true;
   };
 
@@ -842,6 +882,9 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
       if (Array.isArray(item.content)) {
         cloned.content = item.content.map((part) => (part && typeof part === "object" ? { ...part } : part));
       }
+      if (item.function && typeof item.function === "object") {
+        cloned.function = { ...item.function };
+      }
       return cloned;
     });
 
@@ -849,7 +892,11 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
     for (const item of req.input) {
       if (!item || typeof item !== "object") continue;
       const r = roleOf(item);
-      if (r && r !== "user" && r !== "system" && r !== "developer") continue;
+      const t = inputItemTypeOf(item);
+      if (r && r !== "user" && r !== "system" && r !== "developer") {
+        // Non-message items can still contain huge strings (e.g., tool outputs).
+        if (t !== "function_call" && t !== "function_call_output") continue;
+      }
 
       const content = item.content;
       if (typeof content === "string") {
@@ -861,6 +908,23 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
             const t = part.text;
             if (!best || t.length > best.len) best = { obj: part, key: "text", len: t.length };
           }
+        }
+      }
+
+      if (t === "function_call") {
+        if (typeof item.arguments === "string") {
+          const a = item.arguments;
+          if (!best || a.length > best.len) best = { obj: item, key: "arguments", len: a.length };
+        }
+        if (item.function && typeof item.function === "object" && typeof item.function.arguments === "string") {
+          const a = item.function.arguments;
+          if (!best || a.length > best.len) best = { obj: item.function, key: "arguments", len: a.length };
+        }
+      }
+      if (t === "function_call_output") {
+        if (typeof item.output === "string") {
+          const o = item.output;
+          if (!best || o.length > best.len) best = { obj: item, key: "output", len: o.length };
         }
       }
     }
@@ -910,22 +974,55 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
     break;
   }
 
+  droppedUnpairedToolCalls += sanitizeResponsesToolPairs();
+
   const afterLen = safeJsonLen(req);
   if (afterLen > limit) {
-    return { ok: false, error: `Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${limit}; reduce prompt size or raise the limit`, beforeLen, afterLen };
+    // Last resort: keep only a minimal request with the latest user input.
+    let lastUser = null;
+    const input = Array.isArray(req.input) ? req.input : [];
+    for (let i = input.length - 1; i >= 0; i--) {
+      const item = input[i];
+      if (!item || typeof item !== "object") continue;
+      if (roleOf(item) === "user") {
+        lastUser = item;
+        break;
+      }
+    }
+
+    const modelValue = req.model;
+    for (const k of Object.keys(req)) delete req[k];
+    if (modelValue !== undefined) req.model = modelValue;
+    req.input = lastUser ? [lastUser] : [];
+
+    trimmed = true;
+    droppedUnpairedToolCalls += sanitizeResponsesToolPairs();
+    while (safeJsonLen(req) > limit && guard++ < 12) {
+      if (tryTruncateLargestInputText()) {
+        trimmed = true;
+        continue;
+      }
+      if (tryTruncateInstructions()) {
+        trimmed = true;
+        continue;
+      }
+      break;
+    }
   }
 
+  const finalLen = safeJsonLen(req);
   return {
     ok: true,
-    trimmed: trimmed || afterLen !== beforeLen,
+    trimmed: trimmed || finalLen !== beforeLen,
     beforeLen,
-    afterLen,
+    afterLen: finalLen,
     droppedTurns,
     droppedSystem,
     droppedTail,
     truncatedInputChars,
     truncatedInstructionChars,
     droppedTools,
+    droppedUnpairedToolCalls,
   };
 }
 
@@ -1473,9 +1570,6 @@ export async function handleOpenAIRequest({
   if (isTextCompletions) {
     const prompt = reqJson.prompt;
     const promptText = Array.isArray(prompt) ? (typeof prompt[0] === "string" ? prompt[0] : "") : typeof prompt === "string" ? prompt : String(prompt ?? "");
-    if (Number.isInteger(limits.maxInputChars) && limits.maxInputChars > 0 && promptText.length > limits.maxInputChars) {
-      return jsonResponse(400, jsonError(`Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${limits.maxInputChars}; reduce prompt size or raise the limit`));
-    }
     const responsesReq: any = {
       model,
       input: [{ role: "user", content: [{ type: "input_text", text: promptText }] }],
@@ -1486,7 +1580,36 @@ export async function handleOpenAIRequest({
     applyTemperatureTopPFromRequest(reqJson, responsesReq);
     if ("stop" in reqJson) responsesReq.stop = reqJson.stop;
 
-    const variants = responsesReqVariants(responsesReq, upstreamStream);
+    const maxInputChars = Number.isInteger(limits?.maxInputChars) ? limits.maxInputChars : null;
+    if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
+      const trimRes = trimOpenAIResponsesRequestToMaxChars(responsesReq, maxInputChars);
+      if (debug && trimRes.trimmed) {
+        logDebug(debug, reqId, "openai completions trimmed", {
+          beforeLen: trimRes.beforeLen,
+          afterLen: trimRes.afterLen,
+          droppedTurns: trimRes.droppedTurns,
+          droppedSystem: trimRes.droppedSystem,
+          droppedTail: trimRes.droppedTail,
+          truncatedInputChars: trimRes.truncatedInputChars,
+          truncatedInstructionChars: trimRes.truncatedInstructionChars,
+          droppedTools: trimRes.droppedTools,
+          droppedUnpairedToolCalls: trimRes.droppedUnpairedToolCalls,
+        });
+      }
+    }
+
+    const variants0 = responsesReqVariants(responsesReq, upstreamStream);
+    const variants = [];
+    if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
+      for (const v0 of variants0) {
+        if (!v0 || typeof v0 !== "object") continue;
+        const v = { ...v0 };
+        trimOpenAIResponsesRequestToMaxChars(v, maxInputChars);
+        variants.push(v);
+      }
+    } else {
+      variants.push(...variants0);
+    }
     if (debug) {
       const reqLog = safeJsonStringifyForLog(responsesReq);
       logDebug(debug, reqId, "openai completions request", {
@@ -2561,7 +2684,6 @@ export async function handleOpenAIResponsesUpstream({
   const maxInputChars = Number.isInteger(limits?.maxInputChars) ? limits.maxInputChars : null;
   if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
     const trimRes = trimOpenAIResponsesRequestToMaxChars(bodyBase, maxInputChars);
-    if (!trimRes.ok) return jsonResponse(400, jsonError(trimRes.error));
     if (debug && trimRes.trimmed) {
       logDebug(debug, reqId, "openai responses trimmed", {
         beforeLen: trimRes.beforeLen,
@@ -2572,6 +2694,7 @@ export async function handleOpenAIResponsesUpstream({
         truncatedInputChars: trimRes.truncatedInputChars,
         truncatedInstructionChars: trimRes.truncatedInstructionChars,
         droppedTools: trimRes.droppedTools,
+        droppedUnpairedToolCalls: trimRes.droppedUnpairedToolCalls,
       });
     }
   }
@@ -2587,11 +2710,8 @@ export async function handleOpenAIResponsesUpstream({
     for (const v0 of variants0) {
       if (!v0 || typeof v0 !== "object") continue;
       const v = { ...v0 };
-      const t = trimOpenAIResponsesRequestToMaxChars(v, maxInputChars);
-      if (t.ok) variants.push(v);
-    }
-    if (!variants.length) {
-      return jsonResponse(400, jsonError(`Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${maxInputChars}; reduce prompt size or raise the limit`));
+      trimOpenAIResponsesRequestToMaxChars(v, maxInputChars);
+      variants.push(v);
     }
   } else {
     variants.push(...variants0);

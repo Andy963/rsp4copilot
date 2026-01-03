@@ -42,10 +42,11 @@ function parseIntEnv(raw, fallback) {
 }
 
 export function getRsp4CopilotLimits(env) {
+  const defaultMaxInputChars = parseIntEnv(env?.DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS, DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS);
   return {
     maxTurns: parseIntEnv(env?.RSP4COPILOT_MAX_TURNS, DEFAULT_RSP4COPILOT_MAX_TURNS),
     maxMessages: parseIntEnv(env?.RSP4COPILOT_MAX_MESSAGES, DEFAULT_RSP4COPILOT_MAX_MESSAGES),
-    maxInputChars: parseIntEnv(env?.RSP4COPILOT_MAX_INPUT_CHARS, DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS),
+    maxInputChars: parseIntEnv(env?.RSP4COPILOT_MAX_INPUT_CHARS, defaultMaxInputChars),
   };
 }
 
@@ -179,11 +180,7 @@ export function trimOpenAIChatMessages(messages: any, limits: any): any {
       if (dropTail()) {
         continue;
       }
-      return {
-        ok: false,
-        error: `Input exceeds RSP4COPILOT_MAX_MESSAGES=${maxMessages}; reduce chat history or raise the limit`,
-        before,
-      };
+      break;
     }
     return { ok: true };
   };
@@ -203,11 +200,7 @@ export function trimOpenAIChatMessages(messages: any, limits: any): any {
       if (dropTail()) {
         continue;
       }
-      return {
-        ok: false,
-        error: `Input exceeds RSP4COPILOT_MAX_INPUT_CHARS=${maxInputChars}; reduce prompt size or raise the limit`,
-        before,
-      };
+      break;
     }
     return { ok: true };
   };
@@ -217,10 +210,79 @@ export function trimOpenAIChatMessages(messages: any, limits: any): any {
   const r2 = enforceCharsCap();
   if (!r2.ok) return r2;
 
-  const out = [...list.slice(sysStart, systemPrefixEnd), ...list.slice(restStart, restEnd)];
+  let out = [...list.slice(sysStart, systemPrefixEnd), ...list.slice(restStart, restEnd)];
+
+  const safeMessagesChars = (msgs) => measureOpenAIChatMessages(msgs).inputChars;
+  const truncateStringFieldToFit = (msgs, parentObj, key, maxLen) => {
+    if (!parentObj || typeof parentObj !== "object") return 0;
+    const raw = parentObj[key];
+    if (typeof raw !== "string") return 0;
+
+    // Keep the tail of the string (often contains the actual user question).
+    let lo = 0;
+    let hi = raw.length;
+    const original = raw;
+
+    parentObj[key] = "";
+    if (safeMessagesChars(msgs) > maxLen) {
+      parentObj[key] = original;
+      return 0;
+    }
+
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi + 1) / 2);
+      parentObj[key] = original.slice(-mid);
+      if (safeMessagesChars(msgs) <= maxLen) lo = mid;
+      else hi = mid - 1;
+    }
+
+    parentObj[key] = original.slice(-lo);
+    return original.length - lo;
+  };
+
+  let truncatedInputChars = 0;
+  if (charsCap !== Infinity && safeMessagesChars(out) > charsCap) {
+    // Clone messages before mutating any nested text fields.
+    out = out.map((m) => {
+      if (!m || typeof m !== "object") return m;
+      const cloned = { ...m };
+      if (Array.isArray(m.content)) cloned.content = m.content.map((p) => (p && typeof p === "object" ? { ...p } : p));
+      return cloned;
+    });
+
+    const tryTruncateLargestText = () => {
+      let best = null;
+      for (const m of out) {
+        if (!m || typeof m !== "object") continue;
+        const content = m.content;
+        if (typeof content === "string") {
+          if (!best || content.length > best.len) best = { obj: m, key: "content", len: content.length };
+        } else if (Array.isArray(content)) {
+          for (const part of content) {
+            if (!part || typeof part !== "object") continue;
+            if (typeof part.text === "string") {
+              const t = part.text;
+              if (!best || t.length > best.len) best = { obj: part, key: "text", len: t.length };
+            }
+          }
+        }
+      }
+      if (!best || best.len <= 0) return false;
+      const cut = truncateStringFieldToFit(out, best.obj, best.key, charsCap);
+      if (cut <= 0) return false;
+      truncatedInputChars += cut;
+      return true;
+    };
+
+    let guard = 0;
+    while (safeMessagesChars(out) > charsCap && guard++ < 12) {
+      if (!tryTruncateLargestText()) break;
+    }
+  }
+
   const after = measureOpenAIChatMessages(out);
-  const trimmed = sysStart > 0 || restStart > systemPrefixEnd || restEnd < list.length;
-  return { ok: true, messages: out, trimmed, before, after, droppedTurns, droppedSystem, droppedTail };
+  const trimmed = sysStart > 0 || restStart > systemPrefixEnd || restEnd < list.length || truncatedInputChars > 0;
+  return { ok: true, messages: out, trimmed, before, after, droppedTurns, droppedSystem, droppedTail, truncatedInputChars };
 }
 
 export function isDebugEnabled(env) {

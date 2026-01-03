@@ -21,6 +21,7 @@ RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"type":"openai-responses"
 # Chat history limits (optional; defaults shown; set 0 to disable)
 # RSP4COPILOT_MAX_TURNS=40
 # RSP4COPILOT_MAX_MESSAGES=200
+# DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS=300000
 # RSP4COPILOT_MAX_INPUT_CHARS=300000
 
 # --- Legacy (optional) ---
