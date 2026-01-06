@@ -757,6 +757,7 @@ function geminiExtractTextAndToolCalls(respJson) {
   const parts = Array.isArray(cand?.content?.parts) ? cand.content.parts : [];
 
   let text = "";
+  let reasoning = "";
   const toolCalls = [];
 
   // Track the most recent thought/thought_signature for the next function call (2025 API)
@@ -788,6 +789,7 @@ function geminiExtractTextAndToolCalls(respJson) {
       }
       if (typeof thought === "string" && thought) {
         tcItem.thought = thought;
+        reasoning += thought;
       }
       toolCalls.push(tcItem);
 
@@ -805,7 +807,10 @@ function geminiExtractTextAndToolCalls(respJson) {
 
     // Handle standalone thought parts (if they come separately)
     if (typeof p.thought === "string" || typeof p.thought_signature === "string" || typeof p.thoughtSignature === "string") {
-      if (typeof p.thought === "string") pendingThought = p.thought;
+      if (typeof p.thought === "string") {
+        pendingThought = p.thought;
+        if (p.thought) reasoning += p.thought;
+      }
       if (typeof p.thought_signature === "string") pendingThoughtSignature = p.thought_signature;
       if (typeof p.thoughtSignature === "string") pendingThoughtSignature = p.thoughtSignature;
       continue;
@@ -814,7 +819,7 @@ function geminiExtractTextAndToolCalls(respJson) {
 
   const finishReasonRaw = cand?.finishReason ?? cand?.finish_reason;
   const finish_reason = geminiFinishReasonToOpenai(finishReasonRaw, toolCalls.length > 0);
-  return { text, toolCalls, finish_reason, usage: geminiUsageToOpenaiUsage(root?.usageMetadata) };
+  return { text, reasoning, toolCalls, finish_reason, usage: geminiUsageToOpenaiUsage(root?.usageMetadata) };
 }
 
 async function thoughtSignatureCacheUrl(sessionKey) {
@@ -973,7 +978,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
       return jsonResponse(502, jsonError("Gemini upstream returned invalid JSON", "bad_gateway"));
     }
 
-    const { text, toolCalls, finish_reason, usage } = geminiExtractTextAndToolCalls(gjson);
+    const { text, reasoning, toolCalls, finish_reason, usage } = geminiExtractTextAndToolCalls(gjson);
     if (debug) {
       logDebug(debug, reqId, "gemini parsed", {
         finish_reason,
@@ -1014,6 +1019,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
           message: {
             role: "assistant",
             content: toolCallsOut.length ? null : text || "",
+            ...(reasoning && reasoning.trim() ? { reasoning_content: reasoning } : {}),
             ...(toolCallsOut.length ? { tool_calls: toolCallsOut } : {}),
           },
           finish_reason,
@@ -1070,14 +1076,27 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
       await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
     };
 
-      const emitToolCallDelta = async (meta, argsDelta) => {
-        if (!meta || typeof meta !== "object") return;
-        await ensureAssistantRoleSent();
-        const fn: any = {};
-        if (typeof meta.name === "string" && meta.name.trim()) fn.name = meta.name.trim();
-        if (typeof argsDelta === "string" && argsDelta) fn.arguments = argsDelta;
-        const tcItem = {
-          index: meta.index,
+    const emitReasoningDelta = async (deltaText) => {
+      if (typeof deltaText !== "string" || !deltaText) return;
+      await ensureAssistantRoleSent();
+      const chunk = {
+        id: chatId,
+        object: "chat.completion.chunk",
+        created,
+        model: outModel,
+        choices: [{ index: 0, delta: { reasoning_content: deltaText }, finish_reason: null }],
+      };
+      await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+    };
+
+    const emitToolCallDelta = async (meta, argsDelta) => {
+      if (!meta || typeof meta !== "object") return;
+      await ensureAssistantRoleSent();
+      const fn: any = {};
+      if (typeof meta.name === "string" && meta.name.trim()) fn.name = meta.name.trim();
+      if (typeof argsDelta === "string" && argsDelta) fn.arguments = argsDelta;
+      const tcItem = {
+        index: meta.index,
         id: meta.id,
         type: "function",
         function: fn,
@@ -1188,6 +1207,11 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
               const thoughtSig = p.thoughtSignature || p.thought_signature || fc.thoughtSignature || fc.thought_signature || pendingThoughtSignature || "";
               const thought = p.thought || fc.thought || pendingThought || "";
 
+              const directThought = p.thought || fc.thought;
+              if (typeof directThought === "string" && directThought) {
+                await emitReasoningDelta(directThought);
+              }
+
               await upsertToolCall(fc.name, fc.args, thoughtSig, thought);
               // Reset pending after consuming
               pendingThought = "";
@@ -1201,7 +1225,10 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
               typeof p.thought_signature === "string" ||
               typeof p.thoughtSignature === "string"
             ) {
-              if (typeof p.thought === "string") pendingThought = p.thought;
+              if (typeof p.thought === "string") {
+                pendingThought = p.thought;
+                if (p.thought) await emitReasoningDelta(p.thought);
+              }
               if (typeof p.thought_signature === "string") pendingThoughtSignature = p.thought_signature;
               if (typeof p.thoughtSignature === "string") pendingThoughtSignature = p.thoughtSignature;
               continue;

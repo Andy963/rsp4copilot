@@ -398,6 +398,17 @@ export async function handleClaudeChatCompletions({ env, reqJson, model, stream,
     let textContent = "";
     const toolCalls = [];
     let finishReason = "stop";
+    const emitReasoningDelta = async (deltaText) => {
+      if (typeof deltaText !== "string" || !deltaText) return;
+      const chunk = {
+        id: chatId,
+        object: "chat.completion.chunk",
+        created,
+        model: claudeModel,
+        choices: [{ index: 0, delta: { reasoning_content: deltaText }, finish_reason: null }],
+      };
+      await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+    };
     try {
       const reader = claudeResp.body.getReader();
       const decoder = new TextDecoder();
@@ -471,6 +482,8 @@ export async function handleClaudeChatCompletions({ env, reqJson, model, stream,
                 choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }],
               };
               await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+            } else if (event.delta?.type === "thinking_delta" && event.delta.thinking) {
+              await emitReasoningDelta(event.delta.thinking);
             } else if (event.delta?.type === "input_json_delta" && event.delta.partial_json) {
               // Accumulate tool call arguments
               if (currentToolIndex >= 0) {

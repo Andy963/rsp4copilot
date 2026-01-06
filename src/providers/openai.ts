@@ -2025,13 +2025,14 @@ export async function handleOpenAIRequest({
     });
   }
 
-  if (!stream) {
-    let fullText = "";
-    let responseId = null;
-    let sawDelta = false;
-    let sawAnyText = false;
-    let sawToolCall = false;
-    let sawDataLine = false;
+	  if (!stream) {
+	    let fullText = "";
+	    let reasoningText = "";
+	    let responseId = null;
+	    let sawDelta = false;
+	    let sawAnyText = false;
+	    let sawToolCall = false;
+	    let sawDataLine = false;
     let raw = "";
     const toolCallsById = new Map(); // call_id -> { name, args }
     const upsertToolCall = (callIdRaw, nameRaw, argsRaw, mode) => {
@@ -2097,6 +2098,10 @@ export async function handleOpenAIRequest({
           if (item?.type === "function_call") {
             upsertToolCall(item.call_id ?? item.callId ?? item.id, item.name ?? item.function?.name, item.arguments ?? item.function?.arguments, "full");
           }
+          continue;
+        }
+        if ((evt === "response.reasoning.delta" || evt === "response.reasoning_summary.delta") && typeof payload.delta === "string") {
+          reasoningText += payload.delta;
           continue;
         }
         if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string") {
@@ -2170,40 +2175,47 @@ export async function handleOpenAIRequest({
       type: "function",
       function: { name: v.name || "unknown_tool", arguments: v.args && v.args.trim() ? v.args : "{}" },
     }));
-    const finishReason = toolCalls.length ? "tool_calls" : "stop";
-    const contentValue = fullText && fullText.length ? fullText : toolCalls.length ? null : "";
-    if (debug) {
-      logDebug(debug, reqId, "openai chat parsed", {
-        responseId: responseId ? maskSecret(responseId) : "",
-        outId,
-        finish_reason: finishReason,
-        textLen: fullText.length,
-        textPreview: previewString(fullText, 800),
-        toolCalls: toolCalls.map((c) => ({
-          id: c.id,
-          name: c.function?.name || "",
-          argsLen: c.function?.arguments?.length || 0,
-        })),
+	    const finishReason = toolCalls.length ? "tool_calls" : "stop";
+	    const contentValue = fullText && fullText.length ? fullText : toolCalls.length ? null : "";
+	    if (debug) {
+	      logDebug(debug, reqId, "openai chat parsed", {
+	        responseId: responseId ? maskSecret(responseId) : "",
+	        outId,
+	        finish_reason: finishReason,
+	        textLen: fullText.length,
+	        textPreview: previewString(fullText, 800),
+	        reasoningLen: reasoningText.length,
+	        reasoningPreview: previewString(reasoningText, 600),
+	        toolCalls: toolCalls.map((c) => ({
+	          id: c.id,
+	          name: c.function?.name || "",
+	          argsLen: c.function?.arguments?.length || 0,
+	        })),
         sawDataLine,
         sawDelta,
         sawAnyText,
         rawLen: raw.length,
       });
-    }
-    return jsonResponse(200, {
-      id: outId,
-      object: "chat.completion",
-      created,
-      model,
-      choices: [
-        {
-          index: 0,
-          message: { role: "assistant", content: contentValue, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
-          finish_reason: finishReason,
-        },
-      ],
-    });
-  }
+	    }
+	    return jsonResponse(200, {
+	      id: outId,
+	      object: "chat.completion",
+	      created,
+	      model,
+	      choices: [
+	        {
+	          index: 0,
+	          message: {
+	            role: "assistant",
+	            content: contentValue,
+	            ...(reasoningText && reasoningText.trim() ? { reasoning_content: reasoningText } : {}),
+	            ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+	          },
+	          finish_reason: finishReason,
+	        },
+	      ],
+	    });
+	  }
 
   // stream=true
   let chatId = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
@@ -2279,6 +2291,19 @@ export async function handleOpenAIRequest({
             finish_reason: null,
           },
         ],
+      };
+      await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+    };
+
+    const emitReasoningDelta = async (deltaText) => {
+      if (typeof deltaText !== "string" || !deltaText) return;
+      await ensureAssistantRoleSent();
+      const chunk = {
+        id: chatId,
+        object: "chat.completion.chunk",
+        created,
+        model: outModel,
+        choices: [{ index: 0, delta: { reasoning_content: deltaText }, finish_reason: null }],
       };
       await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
     };
@@ -2364,6 +2389,11 @@ export async function handleOpenAIRequest({
             if (item?.type === "function_call") {
               await upsertToolCall(item.call_id ?? item.callId ?? item.id, item.name ?? item.function?.name, item.arguments ?? item.function?.arguments, "full");
             }
+            continue;
+          }
+
+          if ((evt === "response.reasoning.delta" || evt === "response.reasoning_summary.delta") && typeof payload.delta === "string" && payload.delta) {
+            await emitReasoningDelta(payload.delta);
             continue;
           }
 
