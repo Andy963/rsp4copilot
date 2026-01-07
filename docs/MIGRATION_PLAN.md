@@ -43,8 +43,8 @@
 - 新增单一 JSON/JSONC 配置环境变量：
   - `RSP4COPILOT_CONFIG`
 - 配置 schema（version=1）：
-  - `providers.<id>.type`：`openai-responses` | `openai-chat-completions` | `gemini` | `claude`
-  - `providers.<id>.ownedBy`（可选）：用于 `/v1/models` 的 `owned_by`，以及 provider hint 匹配（默认按 type 推断：openai/google/anthropic）
+  - `providers.<id>.apiMode`（兼容：`api_mode` / `type`）：`openai-responses` | `openai-chat-completions` | `gemini` | `claude`
+  - `providers.<id>.ownedBy`（可选）：用于 `/v1/models` 的 `owned_by`，以及 provider hint 匹配（默认按 apiMode 推断：openai/google/anthropic）
   - `providers.<id>.baseURL`：字符串或字符串数组（支持逗号分隔的上游 fallback）
   - `providers.<id>.apiKey` 或 `providers.<id>.apiKeyEnv`
   - `providers.<id>.models.<modelName>.upstreamModel`（可选，默认同名）

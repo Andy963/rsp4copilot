@@ -54,7 +54,7 @@
   "version": 1,
   "providers": {
     "openai": {
-      "type": "openai-responses",
+      "apiMode": "openai-responses",
       "baseURL": "https://your-relay.example/openai",
       "apiKey": "REPLACE_ME",
       "quirks": {
@@ -69,12 +69,14 @@
 }
 ```
 
-### 常用 provider.type
+### 常用 provider.apiMode
+
+> 字段名兼容：推荐 `apiMode`，也支持 `api_mode` / `type`（旧配置兼容）。
 
 - `openai-responses`：上游走 Responses API（支持 reasoning、tool calling、SSE 等）
-- `openai-chat-completions`：上游走 Chat Completions API（`/v1/chat/completions`）
+- `openai-chat-completions`（或 `openai`）：上游走 Chat Completions API（`/v1/chat/completions`）
 - `gemini`：上游走 Gemini `generateContent` / `streamGenerateContent`
-- `claude`：上游走 Claude `/v1/messages`
+- `claude`（或 `anthropic`）：上游走 Claude `/v1/messages`
 
 ## 本地运行（不部署）
 
@@ -149,6 +151,6 @@ Continue 的 OpenAI provider 可能会直接调用 `POST /v1/responses`；本 Wo
 - `apiKey` 填 `WORKER_AUTH_KEY`（不是上游 key）
 - `model` 填短模型名（如 `gpt-5.2` / `claude-sonnet-...` / `gemini-...`）
 
-## Legacy（可选）
+## Legacy
 
-如果未提供 `RSP4COPILOT_CONFIG`，则仅对 `POST /v1/chat/completions` 保持旧的「按模型名前缀」路由逻辑（`gemini-*` / `claude-*` / 其他 -> OpenAI Responses），并继续使用旧的 `OPENAI_BASE_URL`/`GEMINI_BASE_URL`/`CLAUDE_BASE_URL` 等环境变量。
+已移除无配置的前缀路由/旧环境变量方式；请设置 `RSP4COPILOT_CONFIG`。

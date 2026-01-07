@@ -11,9 +11,9 @@
 # Optional: multiple client auth keys (comma-separated)
 # WORKER_AUTH_KEYS=key1,key2,key3
 
-# Config-driven routing (required for multi-protocol mode)
+# Config-driven routing (required)
 # One-line JSON is easiest for .dev.vars; for production prefer the multi-line TOML string in `wrangler.toml.example`.
-RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"type":"openai-responses","baseURL":"https://your-relay.example/openai","apiKey":"REPLACE_ME","models":{"gpt-5.2":{"upstreamModel":"gpt-5.2"}}}}}
+RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"apiMode":"openai-responses","baseURL":"https://your-relay.example/openai","apiKey":"REPLACE_ME","models":{"gpt-5.2":{"upstreamModel":"gpt-5.2"}}}}}
 
 # Debug logging
 # RSP4COPILOT_DEBUG=true
@@ -23,13 +23,3 @@ RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"type":"openai-responses"
 # RSP4COPILOT_MAX_MESSAGES=200
 # DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS=300000
 # RSP4COPILOT_MAX_INPUT_CHARS=300000
-
-# --- Legacy (optional) ---
-# If you don't set RSP4COPILOT_CONFIG, only `/v1/chat/completions` keeps the old prefix routing,
-# and these upstream env vars are used instead:
-# OPENAI_BASE_URL=https://your-relay.example/openai
-# OPENAI_API_KEY=...
-# GEMINI_BASE_URL=https://your-relay.example/gemini
-# GEMINI_API_KEY=...
-# CLAUDE_BASE_URL=https://your-relay.example/api
-# CLAUDE_API_KEY=...

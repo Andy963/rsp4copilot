@@ -61,23 +61,15 @@ export async function dispatchOpenAIChatToProvider({
   const apiKey = getProviderApiKey(env, provider);
   if (!apiKey) return jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${provider.id}`, "server_error"));
 
-  const providerType = typeof provider.type === "string" ? provider.type.trim() : "";
+  const providerApiMode = typeof provider.apiMode === "string" ? provider.apiMode.trim() : "";
 
-  if (providerType === "openai-responses") {
+  if (providerApiMode === "openai-responses") {
     const quirks = provider.quirks || {};
     const providerOpts = provider?.options || {};
     const modelOpts = model?.options || {};
     const responsesPath =
       (provider.endpoints && typeof (provider.endpoints as any).responsesPath === "string" && String((provider.endpoints as any).responsesPath).trim()) ||
       (provider.endpoints && typeof (provider.endpoints as any).responses_path === "string" && String((provider.endpoints as any).responses_path).trim()) ||
-      "";
-    const chatCompletionsPath =
-      (provider.endpoints &&
-        typeof (provider.endpoints as any).chatCompletionsPath === "string" &&
-        String((provider.endpoints as any).chatCompletionsPath).trim()) ||
-      (provider.endpoints &&
-        typeof (provider.endpoints as any).chat_completions_path === "string" &&
-        String((provider.endpoints as any).chat_completions_path).trim()) ||
       "";
 
     const upstreamUrls = joinUrls(provider.baseURLs);
@@ -111,44 +103,10 @@ export async function dispatchOpenAIChatToProvider({
       extraSystemText,
     });
 
-    // Some upstream relays only support Chat Completions (no `/responses` route).
-    // Fall back automatically for common "wrong path" statuses (avoid masking auth/permission errors like 403).
-    if (
-      !resp.ok &&
-      (resp.status === 400 ||
-        resp.status === 404 ||
-        resp.status === 405 ||
-        resp.status === 422 ||
-        resp.status === 500 ||
-        resp.status === 502 ||
-        resp.status === 503)
-    ) {
-      const envChat = envWithOverrides(env, {
-        OPENAI_BASE_URL: upstreamUrls,
-        OPENAI_API_KEY: apiKey,
-        ...(chatCompletionsPath ? { OPENAI_CHAT_COMPLETIONS_PATH: chatCompletionsPath } : null),
-        ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),
-      });
-
-      return await handleOpenAIChatCompletionsUpstream({
-        request,
-        env: envChat,
-        reqJson,
-        model: model.upstreamModel,
-        stream,
-        token: normalizeAuthValue(token),
-        debug,
-        reqId,
-        path: typeof path === "string" ? path : "",
-        startedAt: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
-        extraSystemText,
-      });
-    }
-
     return resp;
   }
 
-  if (providerType === "openai-chat-completions") {
+  if (providerApiMode === "openai-chat-completions") {
     const providerOpts = provider?.options || {};
     const modelOpts = model?.options || {};
     const chatCompletionsPath =
@@ -179,7 +137,7 @@ export async function dispatchOpenAIChatToProvider({
     });
   }
 
-  if (providerType === "claude") {
+  if (providerApiMode === "claude") {
     const providerOpts = provider?.options || {};
     const modelOpts = model?.options || {};
     const messagesPath = provider.endpoints && typeof (provider.endpoints as any).messagesPath === "string" ? String((provider.endpoints as any).messagesPath).trim() : "";
@@ -202,7 +160,7 @@ export async function dispatchOpenAIChatToProvider({
     });
   }
 
-  if (providerType === "gemini") {
+  if (providerApiMode === "gemini") {
     const env2 = envWithOverrides(env, {
       GEMINI_BASE_URL: joinUrls(provider.baseURLs),
       GEMINI_API_KEY: apiKey,
@@ -221,5 +179,5 @@ export async function dispatchOpenAIChatToProvider({
     });
   }
 
-  return jsonResponse(500, jsonError(`Unsupported provider type: ${providerType}`, "server_error"));
+  return jsonResponse(500, jsonError(`Unsupported provider apiMode: ${providerApiMode}`, "server_error"));
 }

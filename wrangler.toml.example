@@ -17,7 +17,7 @@ RSP4COPILOT_CONFIG = '''
   "version": 1,
   "providers": {
     "openai": {
-      "type": "openai-responses",
+      "apiMode": "openai-responses",
       "baseURL": "https://your-relay.example/openai",
       "apiKeyEnv": "OPENAI_API_KEY",
       "models": {
@@ -28,7 +28,7 @@ RSP4COPILOT_CONFIG = '''
       }
     },
     "gemini": {
-      "type": "gemini",
+      "apiMode": "gemini",
       "baseURL": "https://generativelanguage.googleapis.com",
       "apiKeyEnv": "GEMINI_API_KEY",
       "models": {
@@ -37,7 +37,7 @@ RSP4COPILOT_CONFIG = '''
       }
     },
     "claude": {
-      "type": "claude",
+      "apiMode": "claude",
       "baseURL": "https://api.anthropic.com",
       "apiKeyEnv": "CLAUDE_API_KEY",
       "models": {

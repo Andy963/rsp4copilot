@@ -9,8 +9,7 @@
  *                            `POST /gemini/v1beta/models/{model}:streamGenerateContent?alt=sse`
  *
  * Routing:
- * - Config-driven (`modelName` or `providerId.modelName`) via `RSP4COPILOT_CONFIG`
- * - Legacy fallback (no config): prefix-based routing for OpenAI Chat only
+ * - Config-driven (`modelName` or `providerId.modelName`) via `RSP4COPILOT_CONFIG` (required)
  */
 
 import type { Env } from "./common";
@@ -20,8 +19,6 @@ import { getProviderApiKey, parseGatewayConfig } from "./config";
 import { dispatchOpenAIChatToProvider } from "./dispatch";
 import { resolveModel } from "./model_resolver";
 import { geminiModelsList, openaiModelsList } from "./models_list";
-import { handleClaudeChatCompletions, isClaudeModelId } from "./providers/claude";
-import { handleGeminiChatCompletions, isGeminiModelId } from "./providers/gemini";
 import { handleOpenAIRequest, handleOpenAIResponsesUpstream } from "./providers/openai";
 import { geminiRequestToOpenAIChat, openAIChatResponseToGemini } from "./protocols/gemini";
 import { openAIChatResponseToResponses, responsesRequestToOpenAIChat } from "./protocols/responses";
@@ -161,17 +158,10 @@ export default {
         request.method === "GET" &&
         (path === "/v1/models" || path === "/models" || path === "/openai/v1/models" || path === "/claude/v1/models")
       ) {
-        if (gatewayCfg.ok && gatewayCfg.config) return withCors(jsonResponse(200, openaiModelsList(gatewayCfg.config)), corsHeaders);
-
-        const modelsEnv = env.ADAPTER_MODELS || env.MODELS;
-        const modelIds = modelsEnv ? modelsEnv.split(",").map((m) => m.trim()).filter(Boolean) : [env.DEFAULT_MODEL || "gpt-5.2"];
-        return withCors(
-          jsonResponse(200, {
-            object: "list",
-            data: modelIds.map((id) => ({ id, object: "model", created: 0, owned_by: "openai" })),
-          }),
-          corsHeaders,
-        );
+        if (!gatewayCfg.ok || !gatewayCfg.config) {
+          return withCors(jsonResponse(500, jsonError(gatewayCfg.error || "Server misconfigured: missing RSP4COPILOT_CONFIG", "server_error")), corsHeaders);
+        }
+        return withCors(jsonResponse(200, openaiModelsList(gatewayCfg.config)), corsHeaders);
       }
       if (request.method === "GET" && path === "/gemini/v1beta/models") {
         if (!gatewayCfg.ok || !gatewayCfg.config) {
@@ -218,36 +208,15 @@ export default {
           return withCors(resp, corsHeaders);
         }
 
-        // Legacy routing (no config)
-        if (isGeminiModelId(model)) {
-          const resp = await handleGeminiChatCompletions({ request, env, reqJson, model, stream, token, debug, reqId, extraSystemText });
-          return withCors(resp, corsHeaders);
-        }
-        if (isClaudeModelId(model)) {
-          const resp = await handleClaudeChatCompletions({ env, reqJson, model, stream, debug, reqId, extraSystemText });
-          return withCors(resp, corsHeaders);
-        }
-        return withCors(
-          await handleOpenAIRequest({
-            request,
-            env,
-            reqJson,
-            model,
-            stream,
-            token,
-            debug,
-            reqId,
-            path,
-            startedAt,
-            isTextCompletions: false,
-            extraSystemText,
-          }),
-          corsHeaders,
-        );
+        return withCors(jsonResponse(500, jsonError(gatewayCfg.error || "Server misconfigured: missing RSP4COPILOT_CONFIG", "server_error")), corsHeaders);
       }
 
       // OpenAI Text Completions (legacy/compat)
       if (request.method === "POST" && (path === "/v1/completions" || path === "/completions")) {
+        if (!gatewayCfg.ok || !gatewayCfg.config) {
+          return withCors(jsonResponse(500, jsonError(gatewayCfg.error || "Server misconfigured: missing RSP4COPILOT_CONFIG", "server_error")), corsHeaders);
+        }
+
         const parsed = await readJsonBody(request);
         if (!parsed.ok || !parsed.value || typeof parsed.value !== "object") {
           return withCors(jsonResponse(400, jsonError("Invalid JSON body")), corsHeaders);
@@ -255,14 +224,55 @@ export default {
         const reqJson = parsed.value as any;
         const model = reqJson.model;
         if (typeof model !== "string" || !model.trim()) return withCors(jsonResponse(400, jsonError("Missing required field: model")), corsHeaders);
+
+        const providerHint = reqJson.provider ?? reqJson.owned_by ?? reqJson.ownedBy ?? reqJson.owner ?? reqJson.vendor;
+        const resolved = resolveModel(gatewayCfg.config, model, providerHint);
+        if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
+
+        const providerApiMode = typeof resolved.provider.apiMode === "string" ? resolved.provider.apiMode.trim() : "";
+        if (providerApiMode !== "openai-responses") {
+          return withCors(
+            jsonResponse(400, jsonError(`Unsupported apiMode for /v1/completions: ${providerApiMode || "(empty)"}`, "invalid_request_error")),
+            corsHeaders,
+          );
+        }
+
+        const apiKey = getProviderApiKey(env, resolved.provider);
+        if (!apiKey) {
+          return withCors(
+            jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${resolved.provider.id}`, "server_error")),
+            corsHeaders,
+          );
+        }
+
+        const responsesPath =
+          (resolved.provider.endpoints &&
+            typeof (resolved.provider.endpoints as any).responsesPath === "string" &&
+            String((resolved.provider.endpoints as any).responsesPath).trim()) ||
+          (resolved.provider.endpoints &&
+            typeof (resolved.provider.endpoints as any).responses_path === "string" &&
+            String((resolved.provider.endpoints as any).responses_path).trim()) ||
+          "";
+
+        const modelOpts = resolved.model?.options || {};
+        const reasoningEffort = typeof (modelOpts as any).reasoningEffort === "string" ? String((modelOpts as any).reasoningEffort).trim() : "";
+
+        const env2: Env = {
+          ...env,
+          OPENAI_BASE_URL: joinUrls(resolved.provider.baseURLs),
+          OPENAI_API_KEY: apiKey,
+          ...(responsesPath ? { RESP_RESPONSES_PATH: responsesPath } : null),
+          ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
+        };
+
         const stream = Boolean(reqJson.stream);
         const extraSystemText = shouldInjectCopilotToolUseInstructions(request, reqJson) ? copilotToolUseInstructionsText() : "";
         return withCors(
           await handleOpenAIRequest({
             request,
-            env,
+            env: env2,
             reqJson,
-            model,
+            model: resolved.model.upstreamModel,
             stream,
             token,
             debug,
@@ -293,10 +303,10 @@ export default {
 
         const stream = Boolean(respReq.stream);
         const modelId = typeof respReq.model === "string" ? respReq.model : "";
-        const providerType = typeof resolved.provider.type === "string" ? resolved.provider.type.trim() : "";
+        const providerApiMode = typeof resolved.provider.apiMode === "string" ? resolved.provider.apiMode.trim() : "";
 
         // If the upstream is also OpenAI Responses, proxy it directly to preserve multimodal outputs (e.g. images).
-        if (providerType === "openai-responses") {
+        if (providerApiMode === "openai-responses") {
           const apiKey = getProviderApiKey(env, resolved.provider);
           if (!apiKey) {
             return withCors(
@@ -435,8 +445,8 @@ export default {
         if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
         reqJson.model = resolved.model.upstreamModel;
 
-        const providerType = typeof resolved.provider.type === "string" ? resolved.provider.type.trim() : "";
-        if (providerType !== "claude") {
+        const providerApiMode = typeof resolved.provider.apiMode === "string" ? resolved.provider.apiMode.trim() : "";
+        if (providerApiMode !== "claude") {
           return withCors(jsonResponse(400, jsonError("count_tokens requires a claude provider", "invalid_request_error")), corsHeaders);
         }
 

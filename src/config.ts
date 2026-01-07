@@ -11,7 +11,7 @@ export interface ModelConfig {
 
 export interface ProviderConfig {
   id: string;
-  type: string;
+  apiMode: string;
   ownedBy: string;
   baseURLs: string[];
   apiKeyEnv: string;
@@ -37,8 +37,24 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
-function inferProviderOwnedBy(providerType: string, providerId: string): string {
-  const t = typeof providerType === "string" ? providerType.trim().toLowerCase() : "";
+function normalizeProviderApiMode(raw: unknown): string {
+  const v0 = typeof raw === "string" ? raw.trim() : "";
+  if (!v0) return "";
+
+  const v = v0.toLowerCase();
+  if (v === "openai") return "openai-chat-completions";
+  if (v === "openai-chat") return "openai-chat-completions";
+  if (v === "openai-chat-completions") return "openai-chat-completions";
+  if (v === "openai-responses") return "openai-responses";
+  if (v === "anthropic") return "claude";
+  if (v === "claude") return "claude";
+  if (v === "gemini") return "gemini";
+
+  return v0;
+}
+
+function inferProviderOwnedBy(apiMode: string, providerId: string): string {
+  const t = typeof apiMode === "string" ? apiMode.trim().toLowerCase() : "";
   if (!t) return providerId;
   if (t.startsWith("openai")) return "openai";
   if (t === "claude") return "anthropic";
@@ -48,7 +64,13 @@ function inferProviderOwnedBy(providerType: string, providerId: string): string 
 
 function normalizeProviderConfig(id: string, raw: unknown): ProviderConfig {
   const obj = isPlainObject(raw) ? raw : {};
-  const type = typeof obj.type === "string" ? obj.type.trim() : "";
+
+  const apiModeRaw =
+    (typeof (obj as any).apiMode === "string" && String((obj as any).apiMode).trim()) ||
+    (typeof (obj as any).api_mode === "string" && String((obj as any).api_mode).trim()) ||
+    "";
+  const typeRaw = typeof (obj as any).type === "string" ? String((obj as any).type).trim() : "";
+  const apiMode = normalizeProviderApiMode(apiModeRaw || typeRaw);
   const ownedBy =
     (typeof (obj as any).ownedBy === "string" && String((obj as any).ownedBy).trim()) ||
     (typeof (obj as any).owned_by === "string" && String((obj as any).owned_by).trim()) ||
@@ -65,7 +87,7 @@ function normalizeProviderConfig(id: string, raw: unknown): ProviderConfig {
 
   return {
     id,
-    type,
+    apiMode,
     ownedBy,
     baseURLs,
     apiKeyEnv,
@@ -117,9 +139,9 @@ export function parseGatewayConfig(env: Env):
       return { ok: false, config: null, source: "env", error: `Provider id must not contain '.': ${id}` };
     }
     const p = normalizeProviderConfig(id, pr);
-    if (!p.type) return { ok: false, config: null, source: "env", error: `Provider ${id}: missing type` };
+    if (!p.apiMode) return { ok: false, config: null, source: "env", error: `Provider ${id}: missing apiMode` };
     if (!p.baseURLs.length) return { ok: false, config: null, source: "env", error: `Provider ${id}: missing baseURL` };
-    if (!p.ownedBy) p.ownedBy = inferProviderOwnedBy(p.type, id);
+    if (!p.ownedBy) p.ownedBy = inferProviderOwnedBy(p.apiMode, id);
 
     // Normalize base URLs early.
     p.baseURLs = p.baseURLs
