@@ -151,6 +151,11 @@ Continue 的 OpenAI provider 可能会直接调用 `POST /v1/responses`；本 Wo
 - `apiKey` 填 `WORKER_AUTH_KEY`（不是上游 key）
 - `model` 填短模型名（如 `gpt-5.2` / `claude-sonnet-...` / `gemini-...`）
 
+## Thinking/思维链（透传）
+
+- OpenAI Responses：`/v1/responses` 会尽量保持 OpenAI Responses 的输出结构；当上游是非 Responses 协议时，会把 Chat Completions 的 `reasoning_content` 映射为 Responses 的 `type:"reasoning"` 输出项，并在 SSE 中发送 `response.reasoning_text.delta/done`，便于 oai-compatible-copilot 显示 Thinking。
+- Gemini：当模型路由到 `apiMode: "gemini"` 的 provider 时，`/gemini/v1beta/models/...:streamGenerateContent?alt=sse` 会直接代理 Gemini 原生 SSE，保留 `thought: true` 的 thought summaries。
+
 ## Legacy
 
 已移除无配置的前缀路由/旧环境变量方式；请设置 `RSP4COPILOT_CONFIG`。

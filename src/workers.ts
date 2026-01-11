@@ -19,6 +19,7 @@ import { getProviderApiKey, parseGatewayConfig } from "./config";
 import { dispatchOpenAIChatToProvider } from "./dispatch";
 import { resolveModel } from "./model_resolver";
 import { geminiModelsList, openaiModelsList } from "./models_list";
+import { handleGeminiGenerateContentUpstream } from "./providers/gemini";
 import { handleOpenAIRequest, handleOpenAIResponsesUpstream } from "./providers/openai";
 import { geminiRequestToOpenAIChat, openAIChatResponseToGemini } from "./protocols/gemini";
 import { openAIChatResponseToResponses, responsesRequestToOpenAIChat } from "./protocols/responses";
@@ -489,6 +490,31 @@ export default {
         const parsed = await readJsonBody(request);
         if (!parsed.ok || !parsed.value || typeof parsed.value !== "object") {
           return withCors(jsonResponse(400, jsonError("Invalid JSON body")), corsHeaders);
+        }
+
+        const providerApiMode = typeof resolved.provider.apiMode === "string" ? resolved.provider.apiMode.trim() : "";
+        if (providerApiMode === "gemini") {
+          const apiKey = getProviderApiKey(env, resolved.provider);
+          if (!apiKey) {
+            return withCors(
+              jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${resolved.provider.id}`, "server_error")),
+              corsHeaders,
+            );
+          }
+          const env2: Env = {
+            ...env,
+            GEMINI_BASE_URL: joinUrls(resolved.provider.baseURLs),
+            GEMINI_API_KEY: apiKey,
+          };
+          const upstreamResp = await handleGeminiGenerateContentUpstream({
+            env: env2,
+            reqJson: parsed.value,
+            model: resolved.model.upstreamModel,
+            stream,
+            debug,
+            reqId,
+          });
+          return withCors(upstreamResp, corsHeaders);
         }
 
         const openaiReq = geminiRequestToOpenAIChat(parsed.value) as any;

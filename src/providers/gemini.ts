@@ -679,17 +679,40 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
 
   const systemText = appendInstructions(systemTextParts.join("\n").trim(), extraSystemText);
   const generationConfig: any = {};
-  if ("temperature" in reqJson) generationConfig.temperature = reqJson.temperature;
-  if ("top_p" in reqJson) generationConfig.topP = reqJson.top_p;
-  if ("presence_penalty" in reqJson) generationConfig.presencePenalty = reqJson.presence_penalty;
-  if ("frequency_penalty" in reqJson) generationConfig.frequencyPenalty = reqJson.frequency_penalty;
+  // Only copy serializable numeric values; callers may include keys with `undefined` (e.g. Responses->Chat conversion).
+  if (typeof reqJson?.temperature === "number" && Number.isFinite(reqJson.temperature)) generationConfig.temperature = reqJson.temperature;
+  if (typeof reqJson?.top_p === "number" && Number.isFinite(reqJson.top_p)) generationConfig.topP = reqJson.top_p;
+  if (typeof reqJson?.presence_penalty === "number" && Number.isFinite(reqJson.presence_penalty)) generationConfig.presencePenalty = reqJson.presence_penalty;
+  if (typeof reqJson?.frequency_penalty === "number" && Number.isFinite(reqJson.frequency_penalty)) generationConfig.frequencyPenalty = reqJson.frequency_penalty;
 
   const maxTokens = Number.isInteger(reqJson.max_tokens)
     ? reqJson.max_tokens
     : Number.isInteger(reqJson.max_completion_tokens)
       ? reqJson.max_completion_tokens
       : null;
-  if (Number.isInteger(maxTokens)) generationConfig.maxOutputTokens = maxTokens;
+  const defaultMaxOutputTokens = (() => {
+    const candidates = [env?.GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, env?.GEMINI_MAX_OUTPUT_TOKENS, env?.GEMINI_MAX_TOKENS];
+    for (const v of candidates) {
+      const n = typeof v === "number" ? v : typeof v === "string" ? parseInt(v, 10) : NaN;
+      if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    }
+    return 65536;
+  })();
+  // Some Gemini gateways default `maxOutputTokens` to 0 when omitted; always set a safe default.
+  generationConfig.maxOutputTokens = Number.isInteger(maxTokens) ? maxTokens : defaultMaxOutputTokens;
+
+  // Prefer enabling Gemini thought summaries so the client can render a "Thinking" block.
+  // (This is ignored by models that don't support it; callers can override via upstream config if needed.)
+  if (!("thinkingConfig" in generationConfig)) {
+    generationConfig.thinkingConfig = { includeThoughts: true };
+  } else {
+    const tc = generationConfig.thinkingConfig;
+    if (tc && typeof tc === "object" && !Array.isArray(tc)) {
+      if (!("includeThoughts" in tc)) (tc as any).includeThoughts = true;
+    } else if (tc == null) {
+      generationConfig.thinkingConfig = { includeThoughts: true };
+    }
+  }
 
   if ("stop" in reqJson) {
     const st = reqJson.stop;
@@ -758,6 +781,7 @@ function geminiExtractTextAndToolCalls(respJson) {
 
   let text = "";
   let reasoning = "";
+  let thoughtSummarySoFar = "";
   const toolCalls = [];
 
   // Track the most recent thought/thought_signature for the next function call (2025 API)
@@ -766,6 +790,21 @@ function geminiExtractTextAndToolCalls(respJson) {
 
   for (const p of parts) {
     if (!p || typeof p !== "object") continue;
+
+    // Thought summary text comes through as `text` with `thought: true`
+    if (p.thought === true && typeof p.text === "string") {
+      const thoughtSummaryText = p.text;
+      if (thoughtSummaryText) {
+        if (thoughtSummaryText.startsWith(thoughtSummarySoFar)) {
+          thoughtSummarySoFar = thoughtSummaryText;
+        } else if (thoughtSummarySoFar.startsWith(thoughtSummaryText)) {
+          // ignore (already have a longer buffer)
+        } else {
+          thoughtSummarySoFar += thoughtSummaryText;
+        }
+      }
+      continue;
+    }
 
     // Check for functionCall first (2025 API: thoughtSignature is sibling to functionCall in same part)
     const fc = p.functionCall;
@@ -819,7 +858,8 @@ function geminiExtractTextAndToolCalls(respJson) {
 
   const finishReasonRaw = cand?.finishReason ?? cand?.finish_reason;
   const finish_reason = geminiFinishReasonToOpenai(finishReasonRaw, toolCalls.length > 0);
-  return { text, reasoning, toolCalls, finish_reason, usage: geminiUsageToOpenaiUsage(root?.usageMetadata) };
+  const combinedReasoning = [thoughtSummarySoFar, reasoning].map((v) => String(v || "").trim()).filter(Boolean).join("\n\n");
+  return { text, reasoning: combinedReasoning, toolCalls, finish_reason, usage: geminiUsageToOpenaiUsage(root?.usageMetadata) };
 }
 
 async function thoughtSignatureCacheUrl(sessionKey) {
@@ -911,11 +951,12 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
     return jsonResponse(400, jsonError(`Invalid request: ${message}`));
   }
 
+  // Match Gemini's official auth style (and oai-compatible-copilot): API key in `x-goog-api-key`.
+  // Some proxies mis-handle `Authorization` for Gemini and may return empty candidates.
   const geminiHeaders = {
-    "content-type": "application/json",
-    accept: stream ? "text/event-stream" : "application/json",
-    authorization: `Bearer ${geminiKey}`,
-    "x-api-key": geminiKey,
+    "Content-Type": "application/json",
+    Accept: stream ? "text/event-stream" : "application/json",
+    "User-Agent": "rsp4copilot",
     "x-goog-api-key": geminiKey,
   };
 
@@ -971,19 +1012,383 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
   }
 
   if (!stream) {
-    let gjson = null;
-    try {
-      gjson = await gemResp.json();
-    } catch {
-      return jsonResponse(502, jsonError("Gemini upstream returned invalid JSON", "bad_gateway"));
+    const parseGeminiJson = async (resp) => {
+      let gjson = null;
+      try {
+        gjson = await resp.json();
+      } catch {
+        return { ok: false, gjson: null, extracted: null, error: "Gemini upstream returned invalid JSON" };
+      }
+      const extracted = geminiExtractTextAndToolCalls(gjson);
+      return { ok: true, gjson, extracted, error: "" };
+    };
+
+    const shouldRetryEmpty = (extracted) => {
+      if (!extracted || typeof extracted !== "object") return false;
+      const text0 = typeof extracted.text === "string" ? extracted.text.trim() : "";
+      const reasoning0 = typeof extracted.reasoning === "string" ? extracted.reasoning.trim() : "";
+      const toolCalls0 = Array.isArray(extracted.toolCalls) ? extracted.toolCalls : [];
+      return !text0 && toolCalls0.length === 0 && !reasoning0;
+    };
+
+    const primaryParsed = await parseGeminiJson(gemResp);
+    if (!primaryParsed.ok) {
+      return jsonResponse(502, jsonError(primaryParsed.error || "Gemini upstream returned invalid JSON", "bad_gateway"));
     }
 
-    const { text, reasoning, toolCalls, finish_reason, usage } = geminiExtractTextAndToolCalls(gjson);
+    let { extracted } = primaryParsed;
+    let gjson = primaryParsed.gjson;
+
+    // Some Gemini gateways silently drop unsupported `generationConfig` fields (e.g. too-large `maxOutputTokens`),
+    // resulting in a 200 response with empty candidates. Retry with smaller caps and/or without thought summaries.
+    if (shouldRetryEmpty(extracted)) {
+      const originalMax = geminiBody?.generationConfig?.maxOutputTokens;
+      const originalThinkingCfg = geminiBody?.generationConfig?.thinkingConfig;
+      const retryMaxValues = [8192, 4096, 2048];
+
+      const cloneBody = (body) => {
+        try {
+          return JSON.parse(JSON.stringify(body));
+        } catch {
+          return null;
+        }
+      };
+
+      const tryVariant = async (label, bodyOverride) => {
+        if (!bodyOverride || typeof bodyOverride !== "object") return null;
+        try {
+          const resp2 = await fetch(geminiUrl, { method: "POST", headers: geminiHeaders, body: JSON.stringify(bodyOverride) });
+          if (!resp2.ok) return null;
+          const parsed2 = await parseGeminiJson(resp2);
+          if (!parsed2.ok) return null;
+          if (debug) {
+            logDebug(debug, reqId, "gemini retry result", {
+              label,
+              originalMaxOutputTokens: originalMax ?? null,
+              retryMaxOutputTokens: bodyOverride?.generationConfig?.maxOutputTokens ?? null,
+              retryIncludeThoughts: bodyOverride?.generationConfig?.thinkingConfig?.includeThoughts ?? null,
+              textLen: typeof parsed2.extracted?.text === "string" ? parsed2.extracted.text.length : 0,
+              toolCalls: Array.isArray(parsed2.extracted?.toolCalls) ? parsed2.extracted.toolCalls.length : 0,
+            });
+          }
+          return parsed2;
+        } catch {
+          return null;
+        }
+      };
+
+      for (const maxOut of retryMaxValues) {
+        const b1 = cloneBody(geminiBody);
+        if (!b1) continue;
+        if (!b1.generationConfig || typeof b1.generationConfig !== "object") b1.generationConfig = {};
+        b1.generationConfig.maxOutputTokens = maxOut;
+        // Keep thoughts enabled for this retry.
+        if (!b1.generationConfig.thinkingConfig || typeof b1.generationConfig.thinkingConfig !== "object") {
+          b1.generationConfig.thinkingConfig = { includeThoughts: true };
+        } else if (!("includeThoughts" in b1.generationConfig.thinkingConfig)) {
+          b1.generationConfig.thinkingConfig.includeThoughts = true;
+        }
+
+        const retryRes = await tryVariant(`maxOutputTokens=${maxOut}`, b1);
+        if (retryRes && !shouldRetryEmpty(retryRes.extracted)) {
+          gjson = retryRes.gjson;
+          extracted = retryRes.extracted;
+          break;
+        }
+      }
+
+      // Last resort: disable thought summaries (some gateways reject thinkingConfig).
+      if (shouldRetryEmpty(extracted) && originalThinkingCfg) {
+        const b2Base = cloneBody(geminiBody);
+        if (b2Base?.generationConfig && typeof b2Base.generationConfig === "object") {
+          delete b2Base.generationConfig.thinkingConfig;
+        }
+
+        // Try without thinkingConfig first (keep original maxOutputTokens).
+        const retryRes0 = await tryVariant("disableThinkingConfig", b2Base);
+        if (retryRes0 && !shouldRetryEmpty(retryRes0.extracted)) {
+          gjson = retryRes0.gjson;
+          extracted = retryRes0.extracted;
+        } else {
+          // If still empty, also cap maxOutputTokens (some gateways treat large values as 0 output).
+          for (const maxOut of retryMaxValues) {
+            const b2 = cloneBody(b2Base);
+            if (!b2) continue;
+            if (!b2.generationConfig || typeof b2.generationConfig !== "object") b2.generationConfig = {};
+            b2.generationConfig.maxOutputTokens = maxOut;
+            const retryRes = await tryVariant(`disableThinkingConfig maxOutputTokens=${maxOut}`, b2);
+            if (retryRes && !shouldRetryEmpty(retryRes.extracted)) {
+              gjson = retryRes.gjson;
+              extracted = retryRes.extracted;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Some gateways only implement `streamGenerateContent` correctly. If the JSON endpoint is still empty,
+    // retry once via SSE and assemble a non-stream Chat Completions response.
+    if (shouldRetryEmpty(extracted)) {
+      const streamUrl = buildGeminiGenerateContentUrl(geminiBase, geminiModelId, true);
+      const streamHeaders = { ...geminiHeaders, Accept: "text/event-stream" };
+
+      const tryStreamFallback = async (label, bodyOverride) => {
+        if (!streamUrl || !bodyOverride || typeof bodyOverride !== "object") return null;
+        try {
+          const resp2 = await fetch(streamUrl, { method: "POST", headers: streamHeaders, body: JSON.stringify(bodyOverride) });
+          if (!resp2.ok || !resp2.body) {
+            if (debug) {
+              const errText = await resp2.text().catch(() => "");
+              logDebug(debug, reqId, "gemini stream fallback upstream error", {
+                label,
+                status: resp2.status,
+                contentType: resp2.headers.get("content-type") || "",
+                errorPreview: previewString(errText, 1200),
+              });
+            }
+            return null;
+          }
+
+          const toolCallKeyToMeta = new Map(); // key -> { id, name, args, thought_signature?, thought? }
+          let pendingThoughtSoFar = "";
+          let thoughtSummarySoFar = "";
+          let lastFinishReason = "";
+          let textSoFar = "";
+          let usageMetadata: any = null;
+          let bytesIn0 = 0;
+          let sseDataLines0 = 0;
+
+          const reader = resp2.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+          let raw = "";
+          let sawDataLine = false;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunkText = decoder.decode(value, { stream: true });
+            bytesIn0 += chunkText.length;
+            raw += chunkText;
+            buf += chunkText;
+            const lines = buf.split("\n");
+            buf = lines.pop() || "";
+            for (const line of lines) {
+              if (!line.startsWith("data:")) continue;
+              sseDataLines0++;
+              sawDataLine = true;
+              const data = line.slice(5).trim();
+              if (!data) continue;
+              if (data === "[DONE]") {
+                try {
+                  await reader.cancel();
+                } catch {}
+                buf = "";
+                break;
+              }
+              let payload;
+              try {
+                payload = JSON.parse(data);
+              } catch {
+                continue;
+              }
+
+              // Keep the latest usageMetadata if present.
+              if (payload?.usageMetadata && typeof payload.usageMetadata === "object") usageMetadata = payload.usageMetadata;
+
+              const candidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
+              const cand = candidates.length ? candidates[0] : null;
+              const fr = cand?.finishReason ?? cand?.finish_reason;
+              if (typeof fr === "string" && fr.trim()) lastFinishReason = fr.trim();
+
+              const parts = Array.isArray(cand?.content?.parts) ? cand.content.parts : [];
+
+              // Text (exclude thought summary parts)
+              const textJoined = parts
+                .map((p) => {
+                  if (!p || typeof p !== "object") return "";
+                  if ((p as any).thought === true) return "";
+                  return typeof (p as any).text === "string" ? (p as any).text : "";
+                })
+                .filter(Boolean)
+                .join("");
+
+              if (textJoined) {
+                if (textJoined.startsWith(textSoFar)) {
+                  textSoFar = textJoined;
+                } else if (textSoFar.startsWith(textJoined)) {
+                  // ignore (already have a longer buffer)
+                } else {
+                  textSoFar += textJoined;
+                }
+              }
+
+              for (const p of parts) {
+                if (!p || typeof p !== "object") continue;
+
+                // Thought summary text comes through as `text` with `thought: true`.
+                if ((p as any).thought === true && typeof (p as any).text === "string") {
+                  const thoughtSummaryText = (p as any).text;
+                  if (thoughtSummaryText) {
+                    if (thoughtSummaryText.startsWith(thoughtSummarySoFar)) {
+                      thoughtSummarySoFar = thoughtSummaryText;
+                    } else if (thoughtSummarySoFar.startsWith(thoughtSummaryText)) {
+                      // ignore
+                    } else {
+                      thoughtSummarySoFar += thoughtSummaryText;
+                    }
+                  }
+                  continue;
+                }
+
+                const fc = (p as any).functionCall;
+                if (fc && typeof fc === "object") {
+                  const name = typeof fc.name === "string" ? fc.name.trim() : "";
+                  if (!name) continue;
+                  const argsStr = geminiArgsToJsonString(fc.args);
+                  const key = `${name}\n${argsStr}`;
+
+                  if (!toolCallKeyToMeta.has(key)) {
+                    const meta: any = {
+                      id: `call_${crypto.randomUUID().replace(/-/g, "")}`,
+                      name,
+                      args: "",
+                    };
+                    toolCallKeyToMeta.set(key, meta);
+                  }
+                  const meta = toolCallKeyToMeta.get(key);
+                  meta.args = argsStr && argsStr.trim() ? argsStr : "{}";
+
+                  const thoughtSigRaw =
+                    (p as any).thoughtSignature ||
+                    (p as any).thought_signature ||
+                    (fc as any).thoughtSignature ||
+                    (fc as any).thought_signature ||
+                    "";
+                  const thoughtRaw = (p as any).thought || (fc as any).thought || "";
+
+                  if (typeof thoughtSigRaw === "string" && thoughtSigRaw.trim()) meta.thought_signature = thoughtSigRaw.trim();
+                  if (typeof thoughtRaw === "string") meta.thought = thoughtRaw;
+
+                  if (typeof thoughtRaw === "string" && thoughtRaw) {
+                    if (thoughtRaw.startsWith(pendingThoughtSoFar)) {
+                      pendingThoughtSoFar = thoughtRaw;
+                    } else if (pendingThoughtSoFar.startsWith(thoughtRaw)) {
+                      // ignore
+                    } else {
+                      pendingThoughtSoFar += thoughtRaw;
+                    }
+                  }
+                  continue;
+                }
+
+                // Standalone thought (2025 API: thought comes in separate part)
+                if (typeof (p as any).thought === "string") {
+                  const thoughtRaw = (p as any).thought;
+                  if (thoughtRaw) {
+                    if (thoughtRaw.startsWith(pendingThoughtSoFar)) {
+                      pendingThoughtSoFar = thoughtRaw;
+                    } else if (pendingThoughtSoFar.startsWith(thoughtRaw)) {
+                      // ignore
+                    } else {
+                      pendingThoughtSoFar += thoughtRaw;
+                    }
+                  }
+                  continue;
+                }
+              }
+            }
+          }
+
+          // If the upstream didn't actually stream SSE, try parsing the whole body as JSON.
+          if (!sawDataLine && raw.trim()) {
+            try {
+              const obj = JSON.parse(raw);
+              const extracted0 = geminiExtractTextAndToolCalls(obj);
+              if (debug) {
+                logDebug(debug, reqId, "gemini stream fallback non-sse", {
+                  label,
+                  rawPreview: previewString(raw, 1200),
+                  extractedTextLen: typeof extracted0.text === "string" ? extracted0.text.length : 0,
+                  extractedReasoningLen: typeof extracted0.reasoning === "string" ? extracted0.reasoning.length : 0,
+                  extractedToolCalls: Array.isArray(extracted0.toolCalls) ? extracted0.toolCalls.length : 0,
+                });
+              }
+              return extracted0;
+            } catch {
+              // ignore
+            }
+          }
+
+          const toolCalls = Array.from(toolCallKeyToMeta.values()).map((m) => {
+            const tc: any = {
+              id: m.id,
+              type: "function",
+              function: { name: m.name || "", arguments: typeof m.args === "string" && m.args.trim() ? m.args : "{}" },
+            };
+            if (typeof m.thought_signature === "string" && m.thought_signature.trim()) tc.thought_signature = m.thought_signature.trim();
+            if (typeof m.thought === "string") tc.thought = m.thought;
+            return tc;
+          });
+
+          const combinedReasoning = [thoughtSummarySoFar, pendingThoughtSoFar].map((v) => String(v || "").trim()).filter(Boolean).join("\n\n");
+          const extracted = {
+            text: textSoFar,
+            reasoning: combinedReasoning,
+            toolCalls,
+            finish_reason: geminiFinishReasonToOpenai(lastFinishReason, toolCalls.length > 0),
+            usage: geminiUsageToOpenaiUsage(usageMetadata),
+          };
+
+          if (debug) {
+            if (bytesIn0 === 0) {
+              logDebug(debug, reqId, "gemini stream fallback empty body", {
+                label,
+                status: resp2.status,
+                contentType: resp2.headers.get("content-type") || "",
+                contentLength: resp2.headers.get("content-length") || "",
+              });
+            }
+            logDebug(debug, reqId, "gemini stream fallback parsed", {
+              label,
+              bytesIn: bytesIn0,
+              sseDataLines: sseDataLines0,
+              textLen: typeof extracted.text === "string" ? extracted.text.length : 0,
+              reasoningLen: typeof extracted.reasoning === "string" ? extracted.reasoning.length : 0,
+              toolCalls: toolCalls.length,
+              finish_reason: extracted.finish_reason,
+            });
+          }
+
+          return extracted;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err ?? "stream fallback failed");
+          if (debug) logDebug(debug, reqId, "gemini stream fallback error", { label, error: message });
+          return null;
+        }
+      };
+
+      const extracted2 = await tryStreamFallback("streamGenerateContent", geminiBody);
+      if (extracted2 && !shouldRetryEmpty(extracted2)) {
+        extracted = extracted2;
+      } else if (debug) {
+        logDebug(debug, reqId, "gemini stream fallback empty", {
+          textLen: typeof extracted2?.text === "string" ? extracted2.text.length : 0,
+          reasoningLen: typeof extracted2?.reasoning === "string" ? extracted2.reasoning.length : 0,
+          toolCalls: Array.isArray(extracted2?.toolCalls) ? extracted2.toolCalls.length : 0,
+        });
+      }
+    }
+
+    const { text, reasoning, toolCalls, finish_reason, usage } = extracted;
     if (debug) {
       logDebug(debug, reqId, "gemini parsed", {
         finish_reason,
         textLen: typeof text === "string" ? text.length : 0,
         textPreview: typeof text === "string" ? previewString(text, 800) : "",
+        reasoningLen: typeof reasoning === "string" ? reasoning.length : 0,
+        reasoningPreview: typeof reasoning === "string" ? previewString(reasoning, 600) : "",
         toolCalls: toolCalls.map((c) => ({
           name: c.function?.name || "",
           id: c.id || "",
@@ -991,7 +1396,20 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
           hasThoughtSig: !!c.thought_signature,
         })),
         usage: usage || null,
+        candidatesCount: Array.isArray(gjson?.candidates) ? gjson.candidates.length : 0,
+        hasPromptFeedback: !!gjson?.promptFeedback,
       });
+      if (shouldRetryEmpty(extracted)) {
+        const cand0 = Array.isArray((gjson as any)?.candidates) ? (gjson as any).candidates[0] : null;
+        const candPreview = cand0 ? previewString(safeJsonStringifyForLog(cand0), 1600) : "";
+        const rootPreview = previewString(safeJsonStringifyForLog(gjson), 2000);
+        logDebug(debug, reqId, "gemini upstream empty response", {
+          candidatesCount: Array.isArray((gjson as any)?.candidates) ? (gjson as any).candidates.length : 0,
+          candidate0Keys: cand0 && typeof cand0 === "object" ? Object.keys(cand0) : [],
+          candidate0Preview: candPreview,
+          rootPreview,
+        });
+      }
     }
     const created = Math.floor(Date.now() / 1000);
     const toolCallsOut = toolCalls.map((c) => {
@@ -1039,6 +1457,8 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
   let raw = "";
   let textSoFar = "";
   let lastFinishReason = "";
+  let overrideFinishReason: string | null = null;
+  let sawAnyReasoning = false;
   let bytesIn = 0;
   let sseDataLines = 0;
 
@@ -1079,6 +1499,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
     const emitReasoningDelta = async (deltaText) => {
       if (typeof deltaText !== "string" || !deltaText) return;
       await ensureAssistantRoleSent();
+      sawAnyReasoning = true;
       const chunk = {
         id: chatId,
         object: "chat.completion.chunk",
@@ -1158,6 +1579,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
       let finished = false;
       // Track pending thought for 2025 API (thought comes in separate part before functionCall)
       let pendingThought = "";
+      let pendingThoughtSummarySoFar = "";
       let pendingThoughtSignature = "";
 
       while (!finished) {
@@ -1194,12 +1616,41 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
           const parts = Array.isArray(cand?.content?.parts) ? cand.content.parts : [];
 
           const textJoined = parts
-            .map((p) => (p && typeof p === "object" && typeof p.text === "string" ? p.text : ""))
+            .map((p) => {
+              if (!p || typeof p !== "object") return "";
+              // Thought summary text comes through as `text` with `thought: true`.
+              if (p.thought === true) return "";
+              return typeof p.text === "string" ? p.text : "";
+            })
             .filter(Boolean)
             .join("");
 
           for (const p of parts) {
             if (!p || typeof p !== "object") continue;
+
+            // Thought summary text comes through as `text` with `thought: true`
+            if (p.thought === true && typeof p.text === "string") {
+              const thoughtSummaryText = p.text;
+              if (thoughtSummaryText) {
+                let delta = "";
+                if (thoughtSummaryText.startsWith(pendingThoughtSummarySoFar)) {
+                  delta = thoughtSummaryText.slice(pendingThoughtSummarySoFar.length);
+                  pendingThoughtSummarySoFar = thoughtSummaryText;
+                } else if (pendingThoughtSummarySoFar.startsWith(thoughtSummaryText)) {
+                  delta = "";
+                } else {
+                  delta = thoughtSummaryText;
+                  pendingThoughtSummarySoFar += thoughtSummaryText;
+                }
+                if (delta) await emitReasoningDelta(delta);
+              }
+
+              const thoughtSigRaw = p.thoughtSignature || p.thought_signature || "";
+              if (typeof thoughtSigRaw === "string" && thoughtSigRaw.trim()) {
+                pendingThoughtSignature = thoughtSigRaw.trim();
+              }
+              continue;
+            }
 
             const fc = p.functionCall;
             if (fc && typeof fc === "object") {
@@ -1215,6 +1666,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
               await upsertToolCall(fc.name, fc.args, thoughtSig, thought);
               // Reset pending after consuming
               pendingThought = "";
+              pendingThoughtSummarySoFar = "";
               pendingThoughtSignature = "";
               continue;
             }
@@ -1246,7 +1698,12 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
               delta = textJoined;
               textSoFar += textJoined;
             }
-            if (delta) await emitTextDelta(delta);
+            if (delta) {
+              await emitTextDelta(delta);
+              pendingThought = "";
+              pendingThoughtSummarySoFar = "";
+              pendingThoughtSignature = "";
+            }
           }
         }
       }
@@ -1269,12 +1726,130 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
               await upsertToolCall(tc.function?.name, safeJsonParse(tc.function?.arguments || "{}").value, undefined, undefined);
             }
           }
-          if (extracted.text) await emitTextDelta(extracted.text);
-          if (typeof extracted.finish_reason === "string" && extracted.finish_reason) lastFinishReason = extracted.finish_reason;
+          if (typeof extracted.reasoning === "string" && extracted.reasoning.trim()) await emitReasoningDelta(extracted.reasoning);
+          if (extracted.text) {
+            await emitTextDelta(extracted.text);
+            textSoFar = extracted.text;
+          }
+          if (typeof extracted.finish_reason === "string" && extracted.finish_reason) {
+            lastFinishReason = extracted.finish_reason;
+            overrideFinishReason = extracted.finish_reason;
+          }
         } catch {
           // ignore
         }
       }
+
+      // Some Gemini gateways return an "empty" SSE stream when maxOutputTokens is too large.
+      // If we saw no output at all, retry with smaller caps (and keep thought summaries enabled when possible).
+      const sawAnyMeaningful = Boolean(textSoFar) || toolCallKeyToMeta.size > 0 || sawAnyReasoning;
+      if (!sawAnyMeaningful) {
+        const nonStreamUrl = buildGeminiGenerateContentUrl(geminiBase, geminiModelId, false);
+        const nonStreamHeaders = { ...geminiHeaders, Accept: "application/json" };
+
+        const isExtractedEmpty = (extracted) => {
+          if (!extracted || typeof extracted !== "object") return true;
+          const text0 = typeof extracted.text === "string" ? extracted.text.trim() : "";
+          const toolCalls0 = Array.isArray(extracted.toolCalls) ? extracted.toolCalls : [];
+          const reasoning0 = typeof extracted.reasoning === "string" ? extracted.reasoning.trim() : "";
+          return !text0 && toolCalls0.length === 0 && !reasoning0;
+        };
+
+        const cloneBody = (body) => {
+          try {
+            return JSON.parse(JSON.stringify(body));
+          } catch {
+            return null;
+          }
+        };
+
+        const tryVariant = async (label, bodyOverride) => {
+          if (!nonStreamUrl || !bodyOverride || typeof bodyOverride !== "object") return null;
+          try {
+            const resp2 = await fetch(nonStreamUrl, { method: "POST", headers: nonStreamHeaders, body: JSON.stringify(bodyOverride) });
+            if (!resp2.ok) return null;
+            const gjson2 = await resp2.json().catch(() => null);
+            if (!gjson2 || typeof gjson2 !== "object") return null;
+            const extracted2 = geminiExtractTextAndToolCalls(gjson2);
+            if (debug) {
+              logDebug(debug, reqId, "gemini stream empty retry", {
+                label,
+                retryMaxOutputTokens: bodyOverride?.generationConfig?.maxOutputTokens ?? null,
+                retryIncludeThoughts: bodyOverride?.generationConfig?.thinkingConfig?.includeThoughts ?? null,
+                textLen: typeof extracted2?.text === "string" ? extracted2.text.length : 0,
+                reasoningLen: typeof extracted2?.reasoning === "string" ? extracted2.reasoning.length : 0,
+                toolCalls: Array.isArray(extracted2?.toolCalls) ? extracted2.toolCalls.length : 0,
+                candidatesCount: Array.isArray((gjson2 as any)?.candidates) ? (gjson2 as any).candidates.length : 0,
+                hasPromptFeedback: !!(gjson2 as any)?.promptFeedback,
+              });
+            }
+            return { gjson: gjson2, extracted: extracted2 };
+          } catch {
+            return null;
+          }
+        };
+
+        const retryMaxValues = [8192, 4096, 2048];
+        let fallback: any = null;
+
+        for (const maxOut of retryMaxValues) {
+          const b1 = cloneBody(geminiBody);
+          if (!b1) continue;
+          if (!b1.generationConfig || typeof b1.generationConfig !== "object") b1.generationConfig = {};
+          b1.generationConfig.maxOutputTokens = maxOut;
+          if (!b1.generationConfig.thinkingConfig || typeof b1.generationConfig.thinkingConfig !== "object") {
+            b1.generationConfig.thinkingConfig = { includeThoughts: true };
+          } else if (!("includeThoughts" in b1.generationConfig.thinkingConfig)) {
+            b1.generationConfig.thinkingConfig.includeThoughts = true;
+          }
+          const res = await tryVariant(`maxOutputTokens=${maxOut}`, b1);
+          if (res && !isExtractedEmpty(res.extracted)) {
+            fallback = res;
+            break;
+          }
+        }
+
+        // Last resort: disable thought summaries and retry with smaller caps.
+        if (!fallback) {
+          for (const maxOut of retryMaxValues) {
+            const b2 = cloneBody(geminiBody);
+            if (!b2) continue;
+            if (!b2.generationConfig || typeof b2.generationConfig !== "object") b2.generationConfig = {};
+            b2.generationConfig.maxOutputTokens = maxOut;
+            if (b2.generationConfig && typeof b2.generationConfig === "object") {
+              delete b2.generationConfig.thinkingConfig;
+            }
+            const res = await tryVariant(`disableThinkingConfig maxOutputTokens=${maxOut}`, b2);
+            if (res && !isExtractedEmpty(res.extracted)) {
+              fallback = res;
+              break;
+            }
+          }
+        }
+
+        if (fallback && fallback.extracted) {
+          const ex = fallback.extracted;
+          if (typeof ex.reasoning === "string" && ex.reasoning.trim()) {
+            await emitReasoningDelta(ex.reasoning);
+          }
+          if (Array.isArray(ex.toolCalls)) {
+            for (const tc of ex.toolCalls) {
+              const name = tc?.function?.name;
+              const args = tc?.function?.arguments;
+              await upsertToolCall(name, args, tc?.thought_signature, tc?.thought);
+            }
+          }
+          if (typeof ex.text === "string" && ex.text) {
+            await emitTextDelta(ex.text);
+            textSoFar = ex.text;
+          }
+          if (typeof ex.finish_reason === "string" && ex.finish_reason) {
+            lastFinishReason = ex.finish_reason;
+            overrideFinishReason = ex.finish_reason;
+          }
+        }
+      }
+
       if (debug) {
         logDebug(debug, reqId, "gemini stream summary", {
           bytesIn,
@@ -1285,14 +1860,14 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
             argsLen: m.args?.length || 0,
             hasThoughtSig: !!m.thought_signature,
           })),
-          finish_reason: geminiFinishReasonToOpenai(lastFinishReason, toolCallKeyToMeta.size > 0),
+          finish_reason: overrideFinishReason || geminiFinishReasonToOpenai(lastFinishReason, toolCallKeyToMeta.size > 0),
           textLen: textSoFar.length,
         });
       }
 
       if (!sentFinal) {
         try {
-          const finishReason = geminiFinishReasonToOpenai(lastFinishReason, toolCallKeyToMeta.size > 0);
+          const finishReason = overrideFinishReason || geminiFinishReasonToOpenai(lastFinishReason, toolCallKeyToMeta.size > 0);
           const finalChunk = {
             id: chatId,
             object: "chat.completion.chunk",
@@ -1326,4 +1901,116 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
   })();
 
   return new Response(readable, { status: 200, headers: sseHeaders() });
+}
+
+function splitCommaSeparatedUrls(raw) {
+  const text = typeof raw === "string" ? raw : "";
+  return text
+    .split(",")
+    .map((v) => normalizeBaseUrl(v))
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function normalizeGeminiModelIdForUpstream(modelId) {
+  const raw = typeof modelId === "string" ? modelId.trim() : "";
+  if (!raw) return "";
+
+  // Preserve explicit Gemini API paths.
+  if (raw.startsWith("models/") || raw.startsWith("tunedModels/")) return raw;
+
+  // Strip provider namespaces like "google/gemini-3-flash-preview".
+  const last = raw.includes("/") ? raw.split("/").filter(Boolean).pop() || raw : raw;
+  return last;
+}
+
+export async function handleGeminiGenerateContentUpstream({
+  env,
+  reqJson,
+  model,
+  stream,
+  debug,
+  reqId,
+}: {
+  env: any;
+  reqJson: any;
+  model: string;
+  stream: boolean;
+  debug: boolean;
+  reqId: string;
+}): Promise<Response> {
+  const geminiBases = splitCommaSeparatedUrls(env?.GEMINI_BASE_URL);
+  if (!geminiBases.length) return jsonResponse(500, jsonError("Server misconfigured: missing GEMINI_BASE_URL", "server_error"));
+
+  const geminiKey = normalizeAuthValue(env?.GEMINI_API_KEY);
+  if (!geminiKey) return jsonResponse(500, jsonError("Server misconfigured: missing GEMINI_API_KEY", "server_error"));
+
+  const upstreamModelId = normalizeGeminiModelIdForUpstream(model);
+  if (!upstreamModelId) return jsonResponse(400, jsonError("Missing required field: model", "invalid_request_error"));
+
+  const body = { ...(reqJson && typeof reqJson === "object" ? reqJson : {}) };
+  for (const k of Object.keys(body)) {
+    if (k.startsWith("__")) delete body[k];
+  }
+
+  // Strip common gateway hints when present.
+  delete (body as any).model;
+  delete (body as any).stream;
+  delete (body as any).provider;
+  delete (body as any).owned_by;
+  delete (body as any).ownedBy;
+
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: stream ? "text/event-stream" : "application/json",
+    "User-Agent": "rsp4copilot",
+    "x-goog-api-key": geminiKey,
+  };
+
+  let lastResp: Response | null = null;
+  let lastErr: string | null = null;
+
+  for (const base of geminiBases) {
+    const geminiUrl = buildGeminiGenerateContentUrl(base, upstreamModelId, stream);
+    if (!geminiUrl) continue;
+
+    try {
+      const resp = await fetch(geminiUrl, { method: "POST", headers, body: JSON.stringify(body) });
+      if (resp.ok) {
+        if (stream) return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
+        const text = await resp.text();
+        return new Response(text, { status: resp.status, headers: { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" } });
+      }
+
+      const errText = await resp.text().catch(() => "");
+      lastResp = resp;
+      lastErr = errText;
+      const retryable = resp.status >= 500;
+      if (debug) {
+        logDebug(debug, reqId, "gemini upstream error", {
+          upstreamUrl: geminiUrl,
+          status: resp.status,
+          retryable,
+          errorPreview: previewString(errText, 1200),
+        });
+      }
+      if (!retryable) {
+        return new Response(errText, { status: resp.status, headers: { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" } });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err ?? "fetch failed");
+      lastErr = message;
+      if (debug) logDebug(debug, reqId, "gemini upstream fetch failed", { upstreamUrl: geminiUrl, error: message });
+      continue;
+    }
+  }
+
+  if (lastResp) {
+    return new Response(lastErr || "", {
+      status: lastResp.status || 502,
+      headers: { "content-type": lastResp.headers.get("content-type") || "application/json; charset=utf-8" },
+    });
+  }
+
+  return jsonResponse(502, jsonError(`Gemini upstream error: ${lastErr || "no upstream available"}`, "bad_gateway"));
 }

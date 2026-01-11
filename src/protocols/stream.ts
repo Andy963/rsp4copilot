@@ -1,6 +1,8 @@
 function encodeSse(event: string, dataObj: unknown): string {
   const data = typeof dataObj === "string" ? dataObj : JSON.stringify(dataObj);
-  return event ? `event: ${event}\ndata: ${data}\n\n` : `data: ${data}\n\n`;
+  // OpenAI-style SSE: event type is encoded in the JSON `type` field, not the SSE `event:` line.
+  void event;
+  return `data: ${data}\n\n`;
 }
 
 function parseSseLines(text: string): Array<{ event: string; data: string }> {
@@ -33,12 +35,41 @@ function parseSseLines(text: string): Array<{ event: string; data: string }> {
   return out;
 }
 
+function coerceThinkingText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+    if (typeof obj.text === "string") return obj.text;
+    if (typeof obj.thinking === "string") return obj.thinking;
+    if (typeof obj.reasoning === "string") return obj.reasoning;
+    if (typeof obj.summary === "string") return obj.summary;
+    if (typeof obj.value === "string") return obj.value;
+  }
+  return "";
+}
+
 function extractDeltaTextFromOpenAIChatChunk(obj: unknown): string {
   const chunkObj = obj && typeof obj === "object" ? (obj as Record<string, unknown>) : {};
   const choices = Array.isArray((chunkObj as any).choices) ? ((chunkObj as any).choices as unknown[]) : [];
   const c0 = choices.length ? (choices[0] as any) : null;
   const delta = c0 && typeof c0.delta === "object" ? (c0.delta as any) : null;
   if (delta && typeof delta.content === "string") return delta.content;
+  return "";
+}
+
+function extractDeltaReasoningFromOpenAIChatChunk(obj: unknown): string {
+  const chunkObj = obj && typeof obj === "object" ? (obj as Record<string, unknown>) : {};
+  const choices = Array.isArray((chunkObj as any).choices) ? ((chunkObj as any).choices as unknown[]) : [];
+  const c0 = choices.length ? (choices[0] as any) : null;
+  if (!c0 || typeof c0 !== "object") return "";
+
+  const delta = c0 && typeof c0.delta === "object" ? (c0.delta as any) : null;
+  const fromDelta = delta ? coerceThinkingText(delta.reasoning_content ?? delta.thinking ?? delta.reasoning ?? delta.summary) : "";
+  if (typeof fromDelta === "string" && fromDelta) return fromDelta;
+
+  const fromChoice = coerceThinkingText((c0 as any).thinking ?? (c0 as any).reasoning_content);
+  if (typeof fromChoice === "string" && fromChoice) return fromChoice;
+
   return "";
 }
 
@@ -138,9 +169,19 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
   let buffer = "";
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, "")}`;
   const createdAt = Math.floor(Date.now() / 1000);
+  const idSuffix = responseId.startsWith("resp_") ? responseId.slice("resp_".length) : responseId;
+  const messageItemId = `msg_${idSuffix || crypto.randomUUID().replace(/-/g, "")}`;
+  const reasoningItemId = `rs_${idSuffix || crypto.randomUUID().replace(/-/g, "")}`;
+
+  let sequenceNumber = 0;
+  const nextSeq = () => sequenceNumber++;
+
   let outputText = "";
+  let reasoningTextSoFar = "";
   let sawAnyText = false;
+  let sawAnyReasoning = false;
   let messageOutputIndex: number | null = null;
+  let reasoningOutputIndex: number | null = null;
   const toolIndexToCallId = new Map<number, string>();
   const toolCallIdToOutputIndex = new Map<string, number>();
   const toolCallsById = new Map<string, { name: string; args: string; thoughtSignature?: string; thought?: string }>();
@@ -152,7 +193,16 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
         encoder.encode(
           encodeSse("response.created", {
             type: "response.created",
-            response: { id: responseId, object: "response", created_at: createdAt, model: modelId || "" },
+            sequence_number: nextSeq(),
+            response: {
+              id: responseId,
+              object: "response",
+              created_at: createdAt,
+              model: modelId || "",
+              status: "in_progress",
+              output: [],
+              output_text: "",
+            },
           }),
         ),
       );
@@ -189,8 +239,9 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
                     encoder.encode(
                       encodeSse("response.output_item.added", {
                         type: "response.output_item.added",
+                        sequence_number: nextSeq(),
                         output_index: messageOutputIndex,
-                        item: { id: `msg_${responseId}`, type: "message", role: "assistant", content: [] },
+                        item: { id: messageItemId, type: "message", role: "assistant", status: "in_progress", content: [] },
                       }),
                     ),
                   );
@@ -199,10 +250,67 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
                   encoder.encode(
                     encodeSse("response.output_text.delta", {
                       type: "response.output_text.delta",
+                      sequence_number: nextSeq(),
+                      output_index: messageOutputIndex,
+                      item_id: messageItemId,
+                      content_index: 0,
+                      logprobs: [],
                       delta,
                     }),
                   ),
                 );
+              }
+
+              // Reasoning/thinking deltas (e.g. `reasoning_content` from Chat Completions).
+              const reasoningChunk = extractDeltaReasoningFromOpenAIChatChunk(obj);
+              if (reasoningChunk) {
+                let delta0 = "";
+                if (reasoningChunk.startsWith(reasoningTextSoFar)) {
+                  delta0 = reasoningChunk.slice(reasoningTextSoFar.length);
+                  reasoningTextSoFar = reasoningChunk;
+                } else if (reasoningTextSoFar.startsWith(reasoningChunk)) {
+                  delta0 = "";
+                } else {
+                  delta0 = reasoningChunk;
+                  reasoningTextSoFar += reasoningChunk;
+                }
+
+                if (reasoningTextSoFar) sawAnyReasoning = true;
+
+                if (reasoningOutputIndex == null) {
+                  reasoningOutputIndex = nextOutputIndex++;
+                  controller.enqueue(
+                    encoder.encode(
+                      encodeSse("response.output_item.added", {
+                        type: "response.output_item.added",
+                        sequence_number: nextSeq(),
+                        output_index: reasoningOutputIndex,
+                        item: {
+                          id: reasoningItemId,
+                          type: "reasoning",
+                          status: "in_progress",
+                          summary: [],
+                          content: [],
+                        },
+                      }),
+                    ),
+                  );
+                }
+
+                if (delta0) {
+                  controller.enqueue(
+                    encoder.encode(
+                      encodeSse("response.reasoning_text.delta", {
+                        type: "response.reasoning_text.delta",
+                        sequence_number: nextSeq(),
+                        output_index: reasoningOutputIndex,
+                        item_id: reasoningItemId,
+                        content_index: 0,
+                        delta: delta0,
+                      }),
+                    ),
+                  );
+                }
               }
 
               // Tool call deltas
@@ -221,8 +329,16 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
                     encoder.encode(
                       encodeSse("response.output_item.added", {
                         type: "response.output_item.added",
+                        sequence_number: nextSeq(),
                         output_index: toolCallIdToOutputIndex.get(callId),
-                        item: { id: `fc_${callId}`, type: "function_call", call_id: callId, name: td.name || "", arguments: "" },
+                        item: {
+                          id: `fc_${callId}`,
+                          type: "function_call",
+                          status: "in_progress",
+                          call_id: callId,
+                          name: td.name || "",
+                          arguments: "",
+                        },
                       }),
                     ),
                   );
@@ -242,6 +358,9 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
                     encoder.encode(
                       encodeSse("response.function_call_arguments.delta", {
                         type: "response.function_call_arguments.delta",
+                        sequence_number: nextSeq(),
+                        output_index: toolCallIdToOutputIndex.get(callId),
+                        item_id: `fc_${callId}`,
                         call_id: callId,
                         ...(buf0.name ? { name: buf0.name } : {}),
                         ...(buf0.thoughtSignature ? { thought_signature: buf0.thoughtSignature } : {}),
@@ -257,7 +376,33 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
         } finally {
           reader.releaseLock();
           if (sawAnyText) {
-            controller.enqueue(encoder.encode(encodeSse("response.output_text.done", { type: "response.output_text.done", text: outputText })));
+            controller.enqueue(
+              encoder.encode(
+                encodeSse("response.output_text.done", {
+                  type: "response.output_text.done",
+                  sequence_number: nextSeq(),
+                  output_index: messageOutputIndex,
+                  item_id: messageItemId,
+                  content_index: 0,
+                  logprobs: [],
+                  text: outputText,
+                }),
+              ),
+            );
+          }
+          if (sawAnyReasoning) {
+            controller.enqueue(
+              encoder.encode(
+                encodeSse("response.reasoning_text.done", {
+                  type: "response.reasoning_text.done",
+                  sequence_number: nextSeq(),
+                  output_index: reasoningOutputIndex,
+                  item_id: reasoningItemId,
+                  content_index: 0,
+                  text: reasoningTextSoFar,
+                }),
+              ),
+            );
           }
 
           for (const [callId, v] of toolCallsById.entries()) {
@@ -267,6 +412,9 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
               encoder.encode(
                 encodeSse("response.function_call_arguments.done", {
                   type: "response.function_call_arguments.done",
+                  sequence_number: nextSeq(),
+                  output_index: toolCallIdToOutputIndex.get(callId),
+                  item_id: `fc_${callId}`,
                   call_id: callId,
                   ...(name ? { name } : {}),
                   ...(v?.thoughtSignature ? { thought_signature: v.thoughtSignature } : {}),
@@ -279,10 +427,12 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
               encoder.encode(
                 encodeSse("response.output_item.done", {
                   type: "response.output_item.done",
+                  sequence_number: nextSeq(),
                   output_index: toolCallIdToOutputIndex.get(callId) ?? null,
                   item: {
                     id: `fc_${callId}`,
                     type: "function_call",
+                    status: "completed",
                     call_id: callId,
                     ...(name ? { name } : {}),
                     arguments: args,
@@ -298,13 +448,38 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
           if (messageOutputIndex != null) {
             output.push({
               output_index: messageOutputIndex,
-              item: { id: `msg_${responseId}`, type: "message", role: "assistant", content: [{ type: "output_text", text: outputText }] },
+              item: {
+                id: messageItemId,
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: outputText }],
+              },
             });
           } else if (!toolCallsById.size) {
             // Preserve the previous behavior: always return at least one message item.
+            const idx0 = nextOutputIndex++;
             output.push({
-              output_index: 0,
-              item: { id: `msg_${responseId}`, type: "message", role: "assistant", content: [{ type: "output_text", text: "" }] },
+              output_index: idx0,
+              item: {
+                id: messageItemId,
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: "" }],
+              },
+            });
+          }
+          if (sawAnyReasoning) {
+            output.push({
+              output_index: reasoningOutputIndex ?? nextOutputIndex++,
+              item: {
+                id: reasoningItemId,
+                type: "reasoning",
+                status: "completed",
+                summary: [{ type: "summary_text", text: reasoningTextSoFar }],
+                content: [{ type: "reasoning_text", text: reasoningTextSoFar }],
+              },
             });
           }
           for (const [callId, v] of toolCallsById.entries()) {
@@ -316,6 +491,7 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
               item: {
                 id: `fc_${callId}`,
                 type: "function_call",
+                status: "completed",
                 call_id: callId,
                 ...(name ? { name } : {}),
                 arguments: args,
@@ -326,15 +502,42 @@ export function openAIChatSseToResponsesSse(openAiResp: Response, modelId: strin
           }
           output.sort((a, b) => a.output_index - b.output_index);
 
+          if (messageOutputIndex != null) {
+            controller.enqueue(
+              encoder.encode(
+                encodeSse("response.output_item.done", {
+                  type: "response.output_item.done",
+                  sequence_number: nextSeq(),
+                  output_index: messageOutputIndex,
+                  item: output.find((o) => o.output_index === messageOutputIndex)?.item ?? null,
+                }),
+              ),
+            );
+          }
+          if (sawAnyReasoning && reasoningOutputIndex != null) {
+            controller.enqueue(
+              encoder.encode(
+                encodeSse("response.output_item.done", {
+                  type: "response.output_item.done",
+                  sequence_number: nextSeq(),
+                  output_index: reasoningOutputIndex,
+                  item: output.find((o) => o.output_index === reasoningOutputIndex)?.item ?? null,
+                }),
+              ),
+            );
+          }
+
           controller.enqueue(
             encoder.encode(
               encodeSse("response.completed", {
                 type: "response.completed",
+                sequence_number: nextSeq(),
                 response: {
                   id: responseId,
                   object: "response",
                   created_at: createdAt,
                   model: modelId || "",
+                  status: "completed",
                   output_text: outputText,
                   output: output.map((o) => o.item),
                 },
