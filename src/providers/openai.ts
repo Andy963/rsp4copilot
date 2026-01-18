@@ -652,6 +652,37 @@ function responsesReqVariants(responsesReq, stream) {
   variants.length = 0;
   variants.push(...expanded);
 
+  // Prompt caching / safety identifier compatibility:
+  // Some relays reject unknown fields, so add progressively stripped variants as fallbacks.
+  const cacheCompat = [];
+  for (const v of variants) {
+    cacheCompat.push(v);
+    if (!v || typeof v !== "object") continue;
+
+    const hasRetention = typeof v.prompt_cache_retention === "string" && v.prompt_cache_retention.trim();
+    const hasSafety = typeof v.safety_identifier === "string" && v.safety_identifier.trim();
+    if (!hasRetention && !hasSafety) continue;
+
+    if (hasRetention) {
+      const vNoRetention = { ...v };
+      delete vNoRetention.prompt_cache_retention;
+      cacheCompat.push(vNoRetention);
+    }
+
+    if (hasSafety) {
+      const vNoSafety = { ...v };
+      delete vNoSafety.safety_identifier;
+      cacheCompat.push(vNoSafety);
+    }
+
+    const vNoCache = { ...v };
+    delete vNoCache.prompt_cache_retention;
+    delete vNoCache.safety_identifier;
+    cacheCompat.push(vNoCache);
+  }
+  variants.length = 0;
+  variants.push(...cacheCompat);
+
   const seen = new Set();
   const deduped = [];
   for (const v of variants) {
@@ -1509,6 +1540,30 @@ function normalizeReasoningEffort(raw) {
   return v;
 }
 
+function normalizeNonEmptyString(raw) {
+  if (typeof raw !== "string") return "";
+  const v = raw.trim();
+  return v ? v : "";
+}
+
+function normalizePromptCacheRetention(raw) {
+  if (typeof raw !== "string") return "";
+  const v0 = raw.trim();
+  if (!v0) return "";
+  const v = v0.toLowerCase();
+  if (v === "24h" || v === "24hr" || v === "24hrs" || v === "24hours" || v === "24hour") return "24h";
+  if (v === "in-memory" || v === "in_memory" || v === "inmemory" || v === "memory") return "in-memory";
+  return v0;
+}
+
+function getPromptCachingParams(reqJson) {
+  const body = reqJson && typeof reqJson === "object" ? reqJson : {};
+  const prompt_cache_retention = normalizePromptCacheRetention(body?.prompt_cache_retention ?? body?.promptCacheRetention);
+  const safety_identifier = normalizeNonEmptyString(body?.safety_identifier ?? body?.safetyIdentifier);
+
+  return { prompt_cache_retention, safety_identifier };
+}
+
 function getReasoningEffort(reqJson, env) {
   const body = reqJson && typeof reqJson === "object" ? reqJson : null;
   const hasReq =
@@ -1567,6 +1622,7 @@ export async function handleOpenAIRequest({
 
   const limits = getRsp4CopilotLimits(env);
   const reasoningEffort = getReasoningEffort(reqJson, env);
+  const promptCache = getPromptCachingParams(reqJson);
   if (isTextCompletions) {
     const prompt = reqJson.prompt;
     const promptText = Array.isArray(prompt) ? (typeof prompt[0] === "string" ? prompt[0] : "") : typeof prompt === "string" ? prompt : String(prompt ?? "");
@@ -1575,6 +1631,8 @@ export async function handleOpenAIRequest({
       input: [{ role: "user", content: [{ type: "input_text", text: promptText }] }],
     };
     if (reasoningEffort) responsesReq.reasoning = { effort: reasoningEffort };
+    if (promptCache.prompt_cache_retention) responsesReq.prompt_cache_retention = promptCache.prompt_cache_retention;
+    if (promptCache.safety_identifier) responsesReq.safety_identifier = promptCache.safety_identifier;
     if (Number.isInteger(reqJson.max_tokens)) responsesReq.max_output_tokens = reqJson.max_tokens;
     if (Number.isInteger(reqJson.max_completion_tokens)) responsesReq.max_output_tokens = reqJson.max_completion_tokens;
     applyTemperatureTopPFromRequest(reqJson, responsesReq);
@@ -1941,6 +1999,8 @@ export async function handleOpenAIRequest({
     input,
   };
   if (reasoningEffort) fullReq.reasoning = { effort: reasoningEffort };
+  if (promptCache.prompt_cache_retention) fullReq.prompt_cache_retention = promptCache.prompt_cache_retention;
+  if (promptCache.safety_identifier) fullReq.safety_identifier = promptCache.safety_identifier;
   if (effectiveInstructions) fullReq.instructions = effectiveInstructions;
   applyTemperatureTopPFromRequest(reqJson, fullReq);
   if ("stop" in reqJson) fullReq.stop = reqJson.stop;
@@ -1973,6 +2033,8 @@ export async function handleOpenAIRequest({
       : null;
   if (prevReq) {
     if (reasoningEffort) prevReq.reasoning = { effort: reasoningEffort };
+    if (promptCache.prompt_cache_retention) prevReq.prompt_cache_retention = promptCache.prompt_cache_retention;
+    if (promptCache.safety_identifier) prevReq.safety_identifier = promptCache.safety_identifier;
     if (effectiveInstructions) prevReq.instructions = effectiveInstructions;
     applyTemperatureTopPFromRequest(reqJson, prevReq);
     if ("stop" in reqJson) prevReq.stop = reqJson.stop;
@@ -2008,9 +2070,12 @@ export async function handleOpenAIRequest({
 
   // If the upstream doesn't accept `previous_response_id`, fall back to full history.
   if (!sel.ok && prevReq) {
+    if (debug) logDebug(debug, reqId, "openai fallback to full history (previous_response_id rejected)", { status: sel.status });
     const fallbackVariants = responsesReqVariants(fullReq, upstreamStream);
     const sel2 = await selectUpstreamResponseAny(upstreamUrls, headers, fallbackVariants, debug, reqId);
-    if (sel2.ok) sel = sel2;
+    // Always prefer the fallback result (even if it also failed), since the original error
+    // about `previous_response_id` is misleading when the real issue is upstream compatibility.
+    sel = sel2;
   }
   if (!sel.ok && debug) {
     logDebug(debug, reqId, "openai upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
