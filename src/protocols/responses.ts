@@ -22,11 +22,13 @@ function partsToOpenAiContent(parts: unknown): Array<{ type: string; text?: stri
   for (const p of Array.isArray(parts) ? parts : []) {
     if (!p || typeof p !== "object") continue;
     const t = (p as Record<string, unknown>).type;
-    if (t === "input_text" && typeof (p as any).text === "string") {
+    // Handle both "input_text" (Responses format) and "text" (common variant)
+    if ((t === "input_text" || t === "text") && typeof (p as any).text === "string") {
       out.push({ type: "text", text: String((p as any).text) });
       continue;
     }
-    if (t === "input_image") {
+    // Handle both "input_image" and "image_url" variants
+    if (t === "input_image" || t === "image_url") {
       const pObj = p as Record<string, unknown>;
       const imageUrl = (pObj as any).image_url;
       const url =

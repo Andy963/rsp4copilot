@@ -546,12 +546,12 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
         : content == null
           ? ""
           : (() => {
-              try {
-                return JSON.stringify(content);
-              } catch {
-                return String(content);
-              }
-            })();
+            try {
+              return JSON.stringify(content);
+            } catch {
+              return String(content);
+            }
+          })();
     const rawText = typeof raw === "string" ? raw : String(raw ?? "");
 
     const parsed = safeJsonParse(rawText);
@@ -951,6 +951,11 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
     return jsonResponse(400, jsonError(`Invalid request: ${message}`));
   }
 
+  // Validate that contents array is not empty (Gemini requires at least one content item)
+  if (!Array.isArray(geminiBody?.contents) || geminiBody.contents.length === 0) {
+    return jsonResponse(400, jsonError("At least one non-system message is required", "invalid_request_error"));
+  }
+
   // Match Gemini's official auth style (and oai-compatible-copilot): API key in `x-goog-api-key`.
   // Some proxies mis-handle `Authorization` for Gemini and may return empty candidates.
   const geminiHeaders = {
@@ -997,7 +1002,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
     let rawErr = "";
     try {
       rawErr = await gemResp.text();
-    } catch {}
+    } catch { }
     if (debug) logDebug(debug, reqId, "gemini upstream error", { status: gemResp.status, errorPreview: previewString(rawErr, 1200) });
     let message = `Gemini upstream error (status ${gemResp.status})`;
     try {
@@ -1183,7 +1188,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
               if (data === "[DONE]") {
                 try {
                   await reader.cancel();
-                } catch {}
+                } catch { }
                 buf = "";
                 break;
               }
@@ -1709,7 +1714,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
       }
       try {
         await reader.cancel();
-      } catch {}
+      } catch { }
     } catch (err) {
       if (debug) {
         const message = err instanceof Error ? err.message : String(err ?? "stream failed");
@@ -1893,10 +1898,10 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
 
       try {
         await writer.write(encoder.encode(encodeSseData("[DONE]")));
-      } catch {}
+      } catch { }
       try {
         await writer.close();
-      } catch {}
+      } catch { }
     }
   })();
 
@@ -1959,6 +1964,11 @@ export async function handleGeminiGenerateContentUpstream({
   delete (body as any).provider;
   delete (body as any).owned_by;
   delete (body as any).ownedBy;
+
+  // Validate that contents array is not empty (Gemini requires at least one content item)
+  if (!Array.isArray((body as any).contents) || (body as any).contents.length === 0) {
+    return jsonResponse(400, jsonError("At least one non-system message is required (contents array is empty)", "invalid_request_error"));
+  }
 
   const headers = {
     "Content-Type": "application/json",
