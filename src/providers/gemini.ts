@@ -536,8 +536,11 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
     const callIdRaw = msg.tool_call_id ?? msg.toolCallId ?? msg.call_id ?? msg.callId ?? msg.id;
     const callId = typeof callIdRaw === "string" ? callIdRaw.trim() : "";
     const mappedName = callId ? toolNameByCallId.get(callId) || "" : "";
-    const name = mappedName || fallbackName || "";
-    if (!name) return null;
+    const cachedName =
+      callId && sigCache && typeof sigCache === "object" && sigCache[callId] && typeof sigCache[callId].name === "string"
+        ? String(sigCache[callId].name).trim()
+        : "";
+    const name = mappedName || cachedName || fallbackName || "";
 
     const content = msg.content;
     const raw =
@@ -560,6 +563,13 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
       const v = parsed.value;
       if (v != null && typeof v === "object" && !Array.isArray(v)) responseValue = v;
       else responseValue = { output: v };
+    }
+
+    // If we can't map a tool name (e.g. delta-history only contains tool results), degrade to plain text
+    // instead of dropping the entire turn, otherwise `contents` may become empty and Gemini will 400.
+    if (!name) {
+      const label = callId ? `Tool result (call_id=${callId}):` : "Tool result:";
+      return { callId, part: { text: `${label}\n${rawText}` } };
     }
 
     return { callId, part: { functionResponse: { name, response: responseValue } } };
@@ -964,6 +974,8 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
     "User-Agent": "rsp4copilot",
     "x-goog-api-key": geminiKey,
   };
+  const xSessionId = request.headers.get("x-session-id");
+  if (typeof xSessionId === "string" && xSessionId.trim()) geminiHeaders["x-session-id"] = xSessionId.trim();
 
   if (debug) {
     const geminiBodyLog = safeJsonStringifyForLog(geminiBody);
@@ -1930,6 +1942,7 @@ function normalizeGeminiModelIdForUpstream(modelId) {
 }
 
 export async function handleGeminiGenerateContentUpstream({
+  request,
   env,
   reqJson,
   model,
@@ -1937,6 +1950,7 @@ export async function handleGeminiGenerateContentUpstream({
   debug,
   reqId,
 }: {
+  request?: Request;
   env: any;
   reqJson: any;
   model: string;
@@ -1976,6 +1990,8 @@ export async function handleGeminiGenerateContentUpstream({
     "User-Agent": "rsp4copilot",
     "x-goog-api-key": geminiKey,
   };
+  const xSessionId = request?.headers?.get?.("x-session-id");
+  if (typeof xSessionId === "string" && xSessionId.trim()) headers["x-session-id"] = xSessionId.trim();
 
   let lastResp: Response | null = null;
   let lastErr: string | null = null;

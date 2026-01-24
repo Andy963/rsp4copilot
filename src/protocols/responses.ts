@@ -17,6 +17,15 @@ function coerceThinkingText(value: unknown): string {
   return "";
 }
 
+function normalizeResponsesCallId(raw: unknown): string {
+  const id = typeof raw === "string" ? raw.trim() : "";
+  if (!id) return "";
+  // When clients echo back Responses output items as input, they may send `id:"fc_<callId>"`
+  // without `call_id`. Normalize to the actual tool call id.
+  if (id.startsWith("fc_") && id.length > 3) return id.slice(3);
+  return id;
+}
+
 function partsToOpenAiContent(parts: unknown): Array<{ type: string; text?: string; image_url?: { url: string } }> | "" {
   const out: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
   for (const p of Array.isArray(parts) ? parts : []) {
@@ -115,7 +124,7 @@ export function responsesRequestToOpenAIChat(reqJson: unknown): Record<string, u
       // Tool calling: Responses input items -> Chat Completions messages
       if (t === "function_call") {
         const callIdRaw = (itemObj as any).call_id ?? (itemObj as any).callId ?? (itemObj as any).id;
-        const callId = typeof callIdRaw === "string" && callIdRaw.trim() ? callIdRaw.trim() : `call_${crypto.randomUUID().replace(/-/g, "")}`;
+        const callId = normalizeResponsesCallId(callIdRaw) || `call_${crypto.randomUUID().replace(/-/g, "")}`;
         const name = typeof (itemObj as any).name === "string" ? String((itemObj as any).name).trim() : "";
         const args = (itemObj as any).arguments;
         const argStr =
@@ -131,17 +140,27 @@ export function responsesRequestToOpenAIChat(reqJson: unknown): Record<string, u
                   }
                 })();
         if (!name) continue;
+
+        const thoughtSignatureRaw = (itemObj as any).thought_signature ?? (itemObj as any).thoughtSignature;
+        const thoughtSignature = typeof thoughtSignatureRaw === "string" ? thoughtSignatureRaw.trim() : "";
+        const thoughtRaw = (itemObj as any).thought ?? (itemObj as any).reasoning ?? (itemObj as any).reasoning_content;
+        const thought = typeof thoughtRaw === "string" ? thoughtRaw : "";
+
+        const toolCall: any = { id: callId, type: "function", function: { name, arguments: argStr } };
+        if (thoughtSignature) toolCall.thought_signature = thoughtSignature;
+        if (thought) toolCall.thought = thought;
+
         messages.push({
           role: "assistant",
           content: null,
-          tool_calls: [{ id: callId, type: "function", function: { name, arguments: argStr } }],
+          tool_calls: [toolCall],
         });
         continue;
       }
 
       if (t === "function_call_output") {
         const callIdRaw = (itemObj as any).call_id ?? (itemObj as any).callId ?? (itemObj as any).id;
-        const callId = typeof callIdRaw === "string" ? callIdRaw.trim() : "";
+        const callId = normalizeResponsesCallId(callIdRaw);
         const output = normalizeMessageContent((itemObj as any).output ?? (itemObj as any).content ?? "");
         if (!callId) continue;
         messages.push({ role: "tool", tool_call_id: callId, content: output ?? "" });
@@ -153,9 +172,11 @@ export function responsesRequestToOpenAIChat(reqJson: unknown): Record<string, u
       const content = Array.isArray((itemObj as any).content) ? partsToOpenAiContent((itemObj as any).content) : normalizeMessageContent((itemObj as any).content);
 
       // If a tool message was sent in "message" form, try to preserve the call id.
-      const toolCallId = role === "tool" ? normalizeMessageContent((itemObj as any).tool_call_id ?? (itemObj as any).toolCallId ?? (itemObj as any).call_id) : "";
-      if (role === "tool" && typeof toolCallId === "string" && toolCallId.trim()) {
-        messages.push({ role, tool_call_id: toolCallId.trim(), content: content ?? "" });
+      const toolCallIdRaw =
+        role === "tool" ? normalizeMessageContent((itemObj as any).tool_call_id ?? (itemObj as any).toolCallId ?? (itemObj as any).call_id ?? (itemObj as any).id) : "";
+      const toolCallId = normalizeResponsesCallId(toolCallIdRaw);
+      if (role === "tool" && toolCallId) {
+        messages.push({ role, tool_call_id: toolCallId, content: content ?? "" });
       } else {
         messages.push({ role, content });
       }
