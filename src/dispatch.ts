@@ -150,6 +150,7 @@ export async function dispatchOpenAIChatToProvider({
     });
 
     return await handleClaudeChatCompletions({
+      request,
       env: env2,
       reqJson,
       model: model.upstreamModel,

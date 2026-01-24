@@ -1141,6 +1141,70 @@ function extractToolCallsFromResponsesResponse(response) {
   return out;
 }
 
+function extractThoughtSignatureUpdatesFromResponsesResponse(response) {
+  const updates: Record<string, { thought_signature: string; thought?: string; name?: string }> = {};
+  if (!response || typeof response !== "object") return updates;
+
+  const outputs = Array.isArray((response as any).output) ? ((response as any).output as any[]) : [];
+  for (const item of outputs) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type !== "function_call") continue;
+
+    const callId = normalizeResponsesCallId(item.call_id ?? item.callId ?? item.id);
+    if (!callId) continue;
+
+    const thoughtSigRaw = item.thought_signature ?? item.thoughtSignature;
+    const thoughtSig = typeof thoughtSigRaw === "string" ? thoughtSigRaw.trim() : "";
+    if (!thoughtSig) continue;
+
+    const thoughtRaw = item.thought ?? item.reasoning ?? item.reasoning_content;
+    const thought = typeof thoughtRaw === "string" ? thoughtRaw : "";
+    const nameRaw = item.name ?? item.function?.name;
+    const name = typeof nameRaw === "string" ? nameRaw : "";
+    updates[callId] = { thought_signature: thoughtSig, ...(thought ? { thought } : {}), ...(name ? { name } : {}) };
+  }
+
+  return updates;
+}
+
+function collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, updates) {
+  if (!payload || typeof payload !== "object" || !updates || typeof updates !== "object") return;
+
+  // Prefer the final response object when available.
+  if ((payload as any).response && typeof (payload as any).response === "object") {
+    Object.assign(updates, extractThoughtSignatureUpdatesFromResponsesResponse((payload as any).response));
+    return;
+  }
+
+  // Some events include `item` with the output item object.
+  const item = (payload as any).item;
+  if (item && typeof item === "object" && (item as any).type === "function_call") {
+    const callId = normalizeResponsesCallId((item as any).call_id ?? (item as any).callId ?? (item as any).id);
+    const thoughtSigRaw = (item as any).thought_signature ?? (item as any).thoughtSignature;
+    const thoughtSig = typeof thoughtSigRaw === "string" ? thoughtSigRaw.trim() : "";
+    if (callId && thoughtSig) {
+      const thoughtRaw = (item as any).thought ?? (item as any).reasoning ?? (item as any).reasoning_content;
+      const thought = typeof thoughtRaw === "string" ? thoughtRaw : "";
+      const nameRaw = (item as any).name ?? (item as any).function?.name;
+      const name = typeof nameRaw === "string" ? nameRaw : "";
+      (updates as any)[callId] = { thought_signature: thoughtSig, ...(thought ? { thought } : {}), ...(name ? { name } : {}) };
+    }
+    return;
+  }
+
+  // Some events include call info directly (e.g. response.function_call_arguments.done).
+  const callId = normalizeResponsesCallId((payload as any).call_id ?? (payload as any).callId ?? (payload as any).id);
+  const thoughtSigRaw = (payload as any).thought_signature ?? (payload as any).thoughtSignature;
+  const thoughtSig = typeof thoughtSigRaw === "string" ? thoughtSigRaw.trim() : "";
+  if (callId && thoughtSig) {
+    const thoughtRaw = (payload as any).thought ?? (payload as any).reasoning ?? (payload as any).reasoning_content;
+    const thought = typeof thoughtRaw === "string" ? thoughtRaw : "";
+    const nameRaw = (payload as any).name;
+    const name = typeof nameRaw === "string" ? nameRaw : "";
+    (updates as any)[callId] = { thought_signature: thoughtSig, ...(thought ? { thought } : {}), ...(name ? { name } : {}) };
+  }
+}
+
 function extractFromResponsesSseText(sseText) {
   const text0 = typeof sseText === "string" ? sseText : "";
   const lines = text0.split("\n");
@@ -1468,6 +1532,153 @@ async function sessionCacheUrl(sessionKey) {
   return `https://session.rsp2com/${hex}`;
 }
 
+function normalizeResponsesCallId(raw) {
+  const id = typeof raw === "string" ? raw.trim() : "";
+  if (!id) return "";
+  // Some clients echo Responses output items back as input with `id:"fc_<callId>"` but without `call_id`.
+  if (id.startsWith("fc_") && id.length > 3) return id.slice(3);
+  return id;
+}
+
+async function responsesThoughtSignatureCacheUrl(sessionKey) {
+  const hex = await sha256Hex(`resp_thought_sig_${sessionKey}`);
+  return `https://thought-sig.rsp2com/${hex}`;
+}
+
+async function getResponsesThoughtSignatureCache(sessionKey) {
+  try {
+    const cache = !sessionKey || typeof caches === "undefined" ? null : ((caches as any).default ?? null);
+    if (!cache) return {};
+    const url = await responsesThoughtSignatureCacheUrl(sessionKey);
+    const resp = await cache.match(url);
+    if (!resp) return {};
+    const data = await resp.json().catch(() => null);
+    return data && typeof data === "object" && !Array.isArray(data) ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+async function setResponsesThoughtSignatureCache(sessionKey, updates) {
+  try {
+    const cache = !sessionKey || typeof caches === "undefined" ? null : ((caches as any).default ?? null);
+    if (!cache) return;
+    const up = updates && typeof updates === "object" && !Array.isArray(updates) ? updates : {};
+    const keys = Object.keys(up);
+    if (!keys.length) return;
+
+    const existing: any = await getResponsesThoughtSignatureCache(sessionKey);
+    for (const callIdRaw of keys) {
+      const callId = normalizeResponsesCallId(callIdRaw);
+      if (!callId) continue;
+      const u = up[callIdRaw];
+      if (!u || typeof u !== "object") continue;
+      const ts = typeof u.thought_signature === "string" ? u.thought_signature : typeof u.thoughtSignature === "string" ? u.thoughtSignature : "";
+      const thought = typeof u.thought === "string" ? u.thought : "";
+      const name = typeof u.name === "string" ? u.name : "";
+      if (!ts || !String(ts).trim()) continue;
+      existing[callId] = {
+        thought_signature: String(ts).trim(),
+        thought: thought || (existing[callId] && typeof existing[callId].thought === "string" ? existing[callId].thought : "") || "",
+        name: name || (existing[callId] && typeof existing[callId].name === "string" ? existing[callId].name : "") || "",
+        updated_at: Date.now(),
+      };
+    }
+
+    // Keep cache bounded.
+    const entries: any[] = Object.entries(existing);
+    if (entries.length > 200) {
+      entries.sort((a, b) => ((b?.[1]?.updated_at as any) || 0) - ((a?.[1]?.updated_at as any) || 0));
+      const kept = Object.fromEntries(entries.slice(0, 200));
+      for (const k of Object.keys(existing)) {
+        if (!(k in kept)) delete existing[k];
+      }
+    }
+
+    const url = await responsesThoughtSignatureCacheUrl(sessionKey);
+    const req = new Request(url, { method: "GET" });
+    const resp = new Response(JSON.stringify(existing), {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "max-age=86400",
+      },
+    });
+    await cache.put(req, resp);
+  } catch {
+    // ignore
+  }
+}
+
+function applyCachedThoughtSignaturesToResponsesRequest(req, sigCache) {
+  const cache = sigCache && typeof sigCache === "object" && !Array.isArray(sigCache) ? sigCache : {};
+  if (!req || typeof req !== "object") return { filled: 0, dropped: 0, missing: 0 };
+  if (!Array.isArray((req as any).input)) return { filled: 0, dropped: 0, missing: 0 };
+
+  const input = (req as any).input as any[];
+  const callIdsWithOutput = new Set<string>();
+  for (const item of input) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type !== "function_call_output") continue;
+    const callId = normalizeResponsesCallId(item.call_id ?? item.callId ?? item.id);
+    if (callId) callIdsWithOutput.add(callId);
+  }
+
+  let filled = 0;
+  let dropped = 0;
+  let missing = 0;
+  const nextInput: any[] = [];
+
+  for (const item of input) {
+    if (!item || typeof item !== "object") {
+      nextInput.push(item);
+      continue;
+    }
+    if (item.type !== "function_call") {
+      nextInput.push(item);
+      continue;
+    }
+
+    const callId = normalizeResponsesCallId(item.call_id ?? item.callId ?? item.id);
+    if (!callId) {
+      nextInput.push(item);
+      continue;
+    }
+
+    const existingSig = item.thought_signature ?? item.thoughtSignature;
+    if (typeof existingSig === "string" && existingSig.trim()) {
+      nextInput.push(item);
+      continue;
+    }
+
+    const cached = (cache as any)[callId];
+    const cachedSig = cached?.thought_signature ?? cached?.thoughtSignature;
+    if (typeof cachedSig === "string" && cachedSig.trim()) {
+      item.thought_signature = cachedSig.trim();
+      const existingThought = item.thought;
+      if (!(typeof existingThought === "string" && existingThought)) {
+        const cachedThought = cached?.thought;
+        if (typeof cachedThought === "string") item.thought = cachedThought;
+      }
+      filled++;
+      nextInput.push(item);
+      continue;
+    }
+
+    // Some gateways require thought_signature on function_call inputs; if we can't provide it but we do
+    // have the corresponding tool output, drop the function_call item to keep the request valid.
+    if (callIdsWithOutput.has(callId)) {
+      dropped++;
+      continue;
+    }
+
+    missing++;
+    nextInput.push(item);
+  }
+
+  if (dropped > 0) (req as any).input = nextInput;
+  return { filled, dropped, missing };
+}
+
 async function getSessionPreviousResponseId(sessionKey) {
   try {
     const cache = !sessionKey || typeof caches === "undefined" ? null : ((caches as any).default ?? null);
@@ -1618,6 +1829,8 @@ export async function handleOpenAIRequest({
     "x-goog-api-key": upstreamKey,
     "openai-beta": "responses=v1",
   };
+  const xSessionId = request.headers.get("x-session-id");
+  if (typeof xSessionId === "string" && xSessionId.trim()) headers["x-session-id"] = xSessionId.trim();
   if (debug) logDebug(debug, reqId, "openai upstream headers", { headers: redactHeadersForLog(headers) });
 
   const limits = getRsp4CopilotLimits(env);
@@ -1979,9 +2192,11 @@ export async function handleOpenAIRequest({
   }
 
   const sessionKey = getSessionKey(request, reqJson, token);
+  const thoughtSigCache = sessionKey ? await getResponsesThoughtSignatureCache(sessionKey) : {};
   if (debug) {
     logDebug(debug, reqId, "openai session", {
       sessionKey: sessionKey ? maskSecret(sessionKey) : "",
+      thoughtSigCacheEntries: sessionKey ? Object.keys(thoughtSigCache).length : 0,
       multiTurnPossible: hasAssistantMessage(messagesForUpstream),
       withinLimits,
       incoming: incomingStats,
@@ -2046,6 +2261,15 @@ export async function handleOpenAIRequest({
     if (Number.isInteger(maxTokens)) prevReq.max_output_tokens = maxTokens;
   }
 
+  const patchedFull = applyCachedThoughtSignaturesToResponsesRequest(fullReq, thoughtSigCache);
+  const patchedPrev = prevReq ? applyCachedThoughtSignaturesToResponsesRequest(prevReq, thoughtSigCache) : { filled: 0, dropped: 0, missing: 0 };
+  if (debug && (patchedFull.filled || patchedFull.dropped || patchedFull.missing || patchedPrev.filled || patchedPrev.dropped || patchedPrev.missing)) {
+    logDebug(debug, reqId, "openai chat thought_signature patch", {
+      full: patchedFull,
+      prev: patchedPrev,
+    });
+  }
+
   const primaryReq = prevReq || fullReq;
   const primaryVariants = responsesReqVariants(primaryReq, upstreamStream);
   if (debug) {
@@ -2099,6 +2323,7 @@ export async function handleOpenAIRequest({
 	    let sawToolCall = false;
 	    let sawDataLine = false;
     let raw = "";
+    const thoughtSigUpdates: any = {};
     const toolCallsById = new Map(); // call_id -> { name, args }
     const upsertToolCall = (callIdRaw, nameRaw, argsRaw, mode) => {
       const callId = typeof callIdRaw === "string" ? callIdRaw.trim() : "";
@@ -2144,6 +2369,7 @@ export async function handleOpenAIRequest({
         } catch {
           continue;
         }
+        collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
         const evt = payload?.type;
         if (evt === "response.created" && payload?.response && typeof payload.response === "object") {
           const rid = payload.response.id;
@@ -2204,22 +2430,23 @@ export async function handleOpenAIRequest({
     try {
       await reader.cancel();
     } catch {}
-    if (!sawDataLine && raw.trim()) {
-      try {
-        const obj = JSON.parse(raw);
-        if (typeof obj === "string") {
-          const ex = extractFromResponsesSseText(obj);
-          if (!responseId && ex.responseId) responseId = ex.responseId;
-          if (!sawAnyText && ex.text) fullText = ex.text;
-          if (Array.isArray(ex.toolCalls)) {
-            for (const c of ex.toolCalls) upsertToolCall(c.call_id, c.name, c.arguments, "delta");
-          }
-        } else {
-          const responseObj = obj?.response && typeof obj.response === "object" ? obj.response : obj;
-          const rid = responseObj?.id;
-          if (!responseId && typeof rid === "string" && rid) responseId = rid;
-          if (!sawAnyText) fullText = extractOutputTextFromResponsesResponse(responseObj) || fullText;
-          const calls = extractToolCallsFromResponsesResponse(responseObj);
+        if (!sawDataLine && raw.trim()) {
+          try {
+            const obj = JSON.parse(raw);
+            if (typeof obj === "string") {
+              const ex = extractFromResponsesSseText(obj);
+              if (!responseId && ex.responseId) responseId = ex.responseId;
+              if (!sawAnyText && ex.text) fullText = ex.text;
+              if (Array.isArray(ex.toolCalls)) {
+                for (const c of ex.toolCalls) upsertToolCall(c.call_id, c.name, c.arguments, "delta");
+              }
+            } else {
+              const responseObj = obj?.response && typeof obj.response === "object" ? obj.response : obj;
+              Object.assign(thoughtSigUpdates, extractThoughtSignatureUpdatesFromResponsesResponse(responseObj));
+              const rid = responseObj?.id;
+              if (!responseId && typeof rid === "string" && rid) responseId = rid;
+              if (!sawAnyText) fullText = extractOutputTextFromResponsesResponse(responseObj) || fullText;
+              const calls = extractToolCallsFromResponsesResponse(responseObj);
           for (const c of calls) upsertToolCall(c.call_id, c.name, c.arguments, "full");
         }
       } catch {
@@ -2234,6 +2461,7 @@ export async function handleOpenAIRequest({
       await setSessionPreviousResponseId(sessionKey, responseId);
       if (debug) logDebug(debug, reqId, "openai session cache set", { previous_response_id: maskSecret(responseId) });
     }
+    if (sessionKey) await setResponsesThoughtSignatureCache(sessionKey, thoughtSigUpdates);
     const outId = responseId ? `chatcmpl_${responseId}` : `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
     const toolCalls = Array.from(toolCallsById.entries()).map(([id, v]) => ({
       id,
@@ -2304,6 +2532,7 @@ export async function handleOpenAIRequest({
 
   (async () => {
     const streamStartedAt = Date.now();
+    const thoughtSigUpdates: any = {};
     const getToolCallIndex = (callId) => {
       const id = typeof callId === "string" ? callId.trim() : "";
       if (!id) return 0;
@@ -2424,6 +2653,7 @@ export async function handleOpenAIRequest({
           } catch {
             continue;
           }
+          collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
           const evt = payload?.type;
 
           if (evt === "response.created" && payload?.response && typeof payload.response === "object") {
@@ -2541,7 +2771,7 @@ export async function handleOpenAIRequest({
         logDebug(debug, reqId, "openai stream translate error", { error: message });
       }
     } finally {
-      if (!sawDataLine && raw.trim()) {
+          if (!sawDataLine && raw.trim()) {
         if (debug) logDebug(debug, reqId, "openai upstream non-sse sample", { rawPreview: previewString(raw, 1200) });
         try {
           const obj = JSON.parse(raw);
@@ -2570,6 +2800,7 @@ export async function handleOpenAIRequest({
             }
           } else {
             const responseObj = obj?.response && typeof obj.response === "object" ? obj.response : obj;
+            Object.assign(thoughtSigUpdates, extractThoughtSignatureUpdatesFromResponsesResponse(responseObj));
             const rid = responseObj?.id;
             if (!responseId && typeof rid === "string" && rid) {
               responseId = rid;
@@ -2623,6 +2854,7 @@ export async function handleOpenAIRequest({
         await writer.close();
       } catch {}
       if (responseId) await setSessionPreviousResponseId(sessionKey, responseId);
+      if (sessionKey) await setResponsesThoughtSignatureCache(sessionKey, thoughtSigUpdates);
       if (debug) {
         const finishReason = toolCallsById.size ? "tool_calls" : "stop";
         logDebug(debug, reqId, "openai stream summary", {
@@ -2685,6 +2917,8 @@ export async function handleOpenAIChatCompletionsUpstream({
     "x-api-key": upstreamKey,
     "x-goog-api-key": upstreamKey,
   };
+  const xSessionId = request.headers.get("x-session-id");
+  if (typeof xSessionId === "string" && xSessionId.trim()) headers["x-session-id"] = xSessionId.trim();
   if (debug) logDebug(debug, reqId, "openai chat-completions upstream headers", { headers: redactHeadersForLog(headers) });
 
   if (extraSystemText && Array.isArray(body.messages)) {
@@ -2692,7 +2926,6 @@ export async function handleOpenAIChatCompletionsUpstream({
   }
 
   void token;
-  void request;
   void path;
   void startedAt;
 
@@ -2760,6 +2993,8 @@ export async function handleOpenAIResponsesUpstream({
     "x-goog-api-key": upstreamKey,
     "openai-beta": "responses=v1",
   };
+  const xSessionId = request.headers.get("x-session-id");
+  if (typeof xSessionId === "string" && xSessionId.trim()) headers["x-session-id"] = xSessionId.trim();
   if (debug) logDebug(debug, reqId, "openai upstream headers", { headers: redactHeadersForLog(headers) });
 
   const bodyBase = { ...(reqJson && typeof reqJson === "object" ? reqJson : {}) };
@@ -2767,6 +3002,17 @@ export async function handleOpenAIResponsesUpstream({
   bodyBase.stream = upstreamStream;
   for (const k of Object.keys(bodyBase)) {
     if (k.startsWith("__")) delete bodyBase[k];
+  }
+
+  const sessionKey = getSessionKey(request, bodyBase, token);
+  const thoughtSigCache = sessionKey ? await getResponsesThoughtSignatureCache(sessionKey) : {};
+  const patchRes = applyCachedThoughtSignaturesToResponsesRequest(bodyBase, thoughtSigCache);
+  if (debug && (patchRes.filled || patchRes.dropped || patchRes.missing)) {
+    logDebug(debug, reqId, "openai responses thought_signature patch", {
+      sessionKey: sessionKey ? maskSecret(sessionKey) : "",
+      thoughtSigCacheEntries: sessionKey ? Object.keys(thoughtSigCache).length : 0,
+      ...patchRes,
+    });
   }
 
   const reasoningEffort = getReasoningEffort(bodyBase, env);
@@ -2794,8 +3040,6 @@ export async function handleOpenAIResponsesUpstream({
     }
   }
 
-  void token;
-  void request;
   void path;
   void startedAt;
 
@@ -2830,7 +3074,75 @@ export async function handleOpenAIResponsesUpstream({
 
   const resp = sel.resp;
   if (stream) {
-    return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
+    // Pass through SSE, but also cache thought_signature for tool calls (required by some gateways).
+    if (!resp.body || !sessionKey) return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
+
+    const src = resp.body;
+    const decoder = new TextDecoder();
+    let buf0 = "";
+    const thoughtSigUpdates: any = {};
+
+    const tapped = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const reader = src.getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) controller.enqueue(value);
+
+            const chunkText = decoder.decode(value, { stream: true });
+            buf0 += chunkText;
+            const lines = buf0.split("\n");
+            buf0 = lines.pop() || "";
+            for (const line of lines) {
+              if (!line.startsWith("data:")) continue;
+              const data = line.slice(5).trim();
+              if (!data || data === "[DONE]") continue;
+              let payload: any;
+              try {
+                payload = JSON.parse(data);
+              } catch {
+                continue;
+              }
+              collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
+            }
+          }
+        } catch (err) {
+          controller.error(err);
+          return;
+        } finally {
+          try {
+            reader.releaseLock();
+          } catch {}
+        }
+
+        // Best-effort parse of any remaining buffered line.
+        try {
+          const tail = buf0;
+          buf0 = "";
+          for (const line of String(tail || "").split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (!data || data === "[DONE]") continue;
+            let payload: any;
+            try {
+              payload = JSON.parse(data);
+            } catch {
+              continue;
+            }
+            collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
+          }
+        } catch {}
+
+        try {
+          await setResponsesThoughtSignatureCache(sessionKey, thoughtSigUpdates);
+        } catch {}
+        controller.close();
+      },
+    });
+
+    return new Response(tapped, { status: resp.status, headers: sseHeaders() });
   }
 
   const ct = (resp.headers.get("content-type") || "").toLowerCase();
@@ -2894,6 +3206,11 @@ export async function handleOpenAIResponsesUpstream({
   if (!responseObj || typeof responseObj !== "object") {
     if (debug) logDebug(debug, reqId, "openai responses parse failed", { sawDataLine, rawPreview: previewString(raw, 1200) });
     return jsonResponse(502, jsonError("Upstream returned an unreadable event stream", "bad_gateway"));
+  }
+
+  if (sessionKey) {
+    const updates = extractThoughtSignatureUpdatesFromResponsesResponse(responseObj);
+    if (Object.keys(updates).length) await setResponsesThoughtSignatureCache(sessionKey, updates);
   }
 
   if (typeof outModel === "string" && outModel.trim()) responseObj.model = outModel.trim();

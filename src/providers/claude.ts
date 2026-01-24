@@ -224,7 +224,7 @@ function claudeExtractTextAndToolCalls(content) {
   return { text, toolCalls };
 }
 
-export async function handleClaudeChatCompletions({ env, reqJson, model, stream, debug, reqId, extraSystemText }) {
+export async function handleClaudeChatCompletions({ request, env, reqJson, model, stream, debug, reqId, extraSystemText }) {
   const claudeBase = normalizeAuthValue(env.CLAUDE_BASE_URL);
   const claudeKey = normalizeAuthValue(env.CLAUDE_API_KEY);
   if (!claudeBase) return jsonResponse(500, jsonError("Server misconfigured: missing CLAUDE_BASE_URL", "server_error"));
@@ -303,6 +303,8 @@ export async function handleClaudeChatCompletions({ env, reqJson, model, stream,
     "anthropic-version": "2023-06-01",
   };
   if (claudeTools.length) claudeHeaders["anthropic-beta"] = "tools-2024-04-04";
+  const xSessionId = request?.headers?.get?.("x-session-id");
+  if (typeof xSessionId === "string" && xSessionId.trim()) claudeHeaders["x-session-id"] = xSessionId.trim();
   if (debug) {
     const claudeBodyLog = safeJsonStringifyForLog(claudeBody);
     logDebug(debug, reqId, "claude request", {

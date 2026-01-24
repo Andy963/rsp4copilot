@@ -32,7 +32,7 @@ function getCorsHeaders(request: Request): Record<string, string> {
     "access-control-allow-origin": allowOrigin,
     "access-control-allow-methods": "GET,POST,OPTIONS",
     "access-control-allow-headers":
-      "authorization,content-type,x-api-key,x-goog-api-key,anthropic-api-key,x-anthropic-api-key,anthropic-version,anthropic-beta",
+      "authorization,content-type,x-session-id,x-api-key,x-goog-api-key,anthropic-api-key,x-anthropic-api-key,anthropic-version,anthropic-beta",
     "access-control-max-age": "86400",
     vary: "Origin",
   };
@@ -507,6 +507,7 @@ export default {
             GEMINI_API_KEY: apiKey,
           };
           const upstreamResp = await handleGeminiGenerateContentUpstream({
+            request,
             env: env2,
             reqJson: parsed.value,
             model: resolved.model.upstreamModel,
