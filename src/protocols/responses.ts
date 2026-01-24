@@ -31,13 +31,15 @@ function partsToOpenAiContent(parts: unknown): Array<{ type: string; text?: stri
   for (const p of Array.isArray(parts) ? parts : []) {
     if (!p || typeof p !== "object") continue;
     const t = (p as Record<string, unknown>).type;
-    // Handle both "input_text" (Responses format) and "text" (common variant)
-    if ((t === "input_text" || t === "text") && typeof (p as any).text === "string") {
+
+    // Handle common text part variants (e.g. "input_text", "text", "output_text", "reasoning_text").
+    if (typeof (p as any).text === "string" && String((p as any).text)) {
       out.push({ type: "text", text: String((p as any).text) });
       continue;
     }
-    // Handle both "input_image" and "image_url" variants
-    if (t === "input_image" || t === "image_url") {
+
+    // Handle common image part variants.
+    if (t === "input_image" || t === "image_url" || t === "output_image" || t === "image" || "image_url" in (p as any)) {
       const pObj = p as Record<string, unknown>;
       const imageUrl = (pObj as any).image_url;
       const url =
