@@ -4,6 +4,7 @@
 
 主要用途：让 VS Code 的 [OAI Compatible Provider for Copilot](https://marketplace.visualstudio.com/items?itemName=nicepkg.oai-compatible-copilot) 插件可以使用 OpenAI Responses、Gemini、Claude 等上游（通过中转/Relay）。
 
+友情推广：稳定靠谱codex中转: [rightcode](https://www.right.codes/register?aff=D71E64B0)
 ## 入口协议（多选）
 
 - OpenAI Chat Completions：`POST /v1/chat/completions`
