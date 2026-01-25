@@ -16,7 +16,14 @@ export function jsonResponse(status: number, obj: unknown, extraHeaders: Record<
 }
 
 export function jsonError(message, code = "bad_request") {
-  return { error: { message, type: "invalid_request_error", code } };
+  const c = typeof code === "string" ? code.trim().toLowerCase() : "";
+  let type = "invalid_request_error";
+  if (c === "server_error") type = "server_error";
+  else if (c === "bad_gateway") type = "server_error";
+  else if (c === "unauthorized") type = "authentication_error";
+  else if (c === "not_found") type = "not_found_error";
+  else if (c === "invalid_request_error") type = "invalid_request_error";
+  return { error: { message, type, code } };
 }
 
 export function parseBoolEnv(value) {
