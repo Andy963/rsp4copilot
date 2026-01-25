@@ -51,7 +51,7 @@ function buildUpstreamUrls(raw, responsesPathRaw) {
     .map((p) => p.trim())
     .filter(Boolean);
 
-  const out = [];
+  const out: string[] = [];
   const pushUrl = (urlStr) => {
     if (!urlStr || typeof urlStr !== "string") return;
     if (!out.includes(urlStr)) out.push(urlStr);
@@ -146,7 +146,7 @@ function buildChatCompletionsUrls(raw, chatPathRaw) {
     .map((p) => p.trim())
     .filter(Boolean);
 
-  const out = [];
+  const out: string[] = [];
   const pushUrl = (urlStr) => {
     if (!urlStr || typeof urlStr !== "string") return;
     if (!out.includes(urlStr)) out.push(urlStr);
@@ -217,7 +217,7 @@ function buildChatCompletionsUrls(raw, chatPathRaw) {
 }
 
 function messageContentToResponsesParts(content) {
-  const out = [];
+  const out: any[] = [];
 
   const normalizeMimeType = (v) => {
     if (typeof v !== "string") return "";
@@ -331,7 +331,7 @@ function messageContentToResponsesParts(content) {
 
 function openaiToolsToResponsesTools(tools) {
   const list = Array.isArray(tools) ? tools : [];
-  const out = [];
+  const out: any[] = [];
 
   for (const t of list) {
     if (!t || typeof t !== "object") continue;
@@ -389,8 +389,8 @@ function openaiToolChoiceToResponsesToolChoice(toolChoice) {
 }
 
 function chatMessagesToResponsesInput(messages) {
-  const instructionsParts = [];
-  const inputItems = [];
+  const instructionsParts: string[] = [];
+  const inputItems: any[] = [];
 
   for (const msg of Array.isArray(messages) ? messages : []) {
     if (!msg || typeof msg !== "object") continue;
@@ -500,7 +500,7 @@ function shouldRetryUpstream(status, bodyText = "") {
 }
 
 function responsesReqToPrompt(responsesReq) {
-  const parts = [];
+  const parts: string[] = [];
   if (typeof responsesReq.instructions === "string" && responsesReq.instructions.trim()) {
     parts.push(responsesReq.instructions.trim());
   }
@@ -516,7 +516,7 @@ function responsesReqToPrompt(responsesReq) {
 }
 
 function responsesReqVariants(responsesReq, stream) {
-  const variants = [];
+  const variants: any[] = [];
   const base = { ...responsesReq, stream: Boolean(stream) };
   variants.push(base);
 
@@ -597,7 +597,7 @@ function responsesReqVariants(responsesReq, stream) {
   // Some gateways expect `input_image.image_url` to be an object like `{ url }`.
   // If we detect images, add compatibility variants that rewrite that field.
   if (containsImages) {
-    const imageObjVariants = [];
+    const imageObjVariants: any[] = [];
     for (const v of variants) {
       if (!v || typeof v !== "object" || !Array.isArray(v.input)) continue;
       let changed = false;
@@ -626,7 +626,7 @@ function responsesReqVariants(responsesReq, stream) {
   // - Some gateways accept `reasoning: { effort }`
   // - Others accept `reasoning_effort: "<effort>"`
   // - If a gateway rejects reasoning params, try a no-reasoning fallback.
-  const expanded = [];
+  const expanded: any[] = [];
   for (const v of variants) {
     expanded.push(v);
     if (!v || typeof v !== "object") continue;
@@ -654,7 +654,7 @@ function responsesReqVariants(responsesReq, stream) {
 
   // Prompt caching / safety identifier compatibility:
   // Some relays reject unknown fields, so add progressively stripped variants as fallbacks.
-  const cacheCompat = [];
+  const cacheCompat: any[] = [];
   for (const v of variants) {
     cacheCompat.push(v);
     if (!v || typeof v !== "object") continue;
@@ -684,7 +684,7 @@ function responsesReqVariants(responsesReq, stream) {
   variants.push(...cacheCompat);
 
   const seen = new Set();
-  const deduped = [];
+  const deduped: any[] = [];
   for (const v of variants) {
     const key = JSON.stringify(v);
     if (seen.has(key)) continue;
@@ -760,7 +760,7 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
     if (!sawFunctionCall) return 0;
 
     let removed = 0;
-    const nextInput = [];
+    const nextInput: any[] = [];
     for (const item of req.input) {
       const t = inputItemTypeOf(item);
       if (t === "function_call") {
@@ -819,7 +819,7 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
     let systemPrefixEnd = 0;
     while (systemPrefixEnd < input.length && isSystemRole(roleOf(input[systemPrefixEnd]))) systemPrefixEnd++;
 
-    const userIdxs = [];
+    const userIdxs: number[] = [];
     for (let i = systemPrefixEnd; i < input.length; i++) {
       if (roleOf(input[i]) === "user") userIdxs.push(i);
     }
@@ -919,7 +919,7 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
       return cloned;
     });
 
-    let best = null;
+    let best: { obj: any; key: string; len: number } | null = null;
     for (const item of req.input) {
       if (!item || typeof item !== "object") continue;
       const r = roleOf(item);
@@ -1010,7 +1010,7 @@ function trimOpenAIResponsesRequestToMaxChars(req, maxChars) {
   const afterLen = safeJsonLen(req);
   if (afterLen > limit) {
     // Last resort: keep only a minimal request with the latest user input.
-    let lastUser = null;
+    let lastUser: any | null = null;
     const input = Array.isArray(req.input) ? req.input : [];
     for (let i = input.length - 1; i >= 0; i--) {
       const item = input[i];
@@ -1067,7 +1067,7 @@ function extractOutputTextFromResponsesResponse(response) {
     if (joined) return joined;
   }
 
-  const parts = [];
+  const parts: string[] = [];
   const push = (v) => {
     if (typeof v === "string" && v) parts.push(v);
   };
@@ -1102,7 +1102,7 @@ function extractOutputTextFromResponsesResponse(response) {
 }
 
 function extractToolCallsFromResponsesResponse(response) {
-  const out = [];
+  const out: any[] = [];
   if (!response || typeof response !== "object") return out;
 
   const seen = new Set();
@@ -1209,12 +1209,12 @@ function extractFromResponsesSseText(sseText) {
   const text0 = typeof sseText === "string" ? sseText : "";
   const lines = text0.split("\n");
   let text = "";
-  let responseId = null;
-  let model = null;
-  let createdAt = null;
+  let responseId: string | null = null;
+  let model: string | null = null;
+  let createdAt: number | null = null;
   let sawDelta = false;
   let sawAnyText = false;
-  const toolCalls = [];
+  const toolCalls: any[] = [];
 
   for (const line of lines) {
     if (!line.startsWith("data:")) continue;
@@ -1284,7 +1284,7 @@ function extractFromResponsesSseText(sseText) {
 async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = false, reqId = "") {
   let lastStatus = 502;
   let lastText = "";
-  let firstErr = null; // { status, text }
+  let firstErr: { status: number; text: string } | null = null; // { status, text }
   let exhaustedRetryable = false;
   let sawEmptyEventStream = false;
 
@@ -1295,7 +1295,7 @@ async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = fa
     headers2.accept = "application/json";
 
     const v0 = variantObj;
-    const tries = [];
+    const tries: any[] = [];
 
     const vStreamFalse = { ...v0, stream: false };
     tries.push({ label: "stream:false", value: vStreamFalse });
@@ -1452,26 +1452,32 @@ function shouldTryNextUpstreamUrl(status) {
 }
 
 async function isProbablyEmptyEventStream(resp) {
-  let reader = null;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   try {
     const ct = (resp?.headers?.get("content-type") || "").toLowerCase();
     if (!ct.includes("text/event-stream")) return false;
     if (!resp?.body) return true;
 
     const clone = resp.clone();
-    reader = clone.body.getReader();
+    const reader0 = clone.body?.getReader();
+    if (!reader0) return true;
+    reader = reader0;
 
     let bytesSeen = 0;
     const deadlineMs = 150;
     const startedAt = Date.now();
 
-    const readWithTimeout = (ms) => {
-      let timeoutId = null;
-      const timeout = new Promise((resolve) => {
+    type ReadWithTimeoutResult =
+      | { timeout: true }
+      | { timeout: false; done: boolean; value?: Uint8Array };
+
+    const readWithTimeout = (ms: number): Promise<ReadWithTimeoutResult> => {
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      const timeout = new Promise<{ timeout: true }>((resolve) => {
         timeoutId = setTimeout(() => resolve({ timeout: true }), ms);
       });
-      const read = reader.read().then((r) => ({ timeout: false, ...r }));
-      return Promise.race([read, timeout]).finally(() => {
+      const read = reader0.read().then((r) => ({ timeout: false as const, ...r }));
+      return (Promise.race([read, timeout]) as Promise<ReadWithTimeoutResult>).finally(() => {
         if (timeoutId) clearTimeout(timeoutId);
       });
     };
@@ -1481,11 +1487,9 @@ async function isProbablyEmptyEventStream(resp) {
       const first = await readWithTimeout(Math.min(50, remaining));
 
       // If it hasn't produced anything quickly, assume it's not empty (could just be slow model output).
-      if (first?.timeout) return false;
-
-      const { done, value } = first || {};
-      if (done) return bytesSeen === 0;
-
+      if (first.timeout) return false;
+      if (first.done) return bytesSeen === 0;
+      const value = first.value;
       if (value && typeof value.length === "number") {
         if (value.length > 0) return false;
         // Some runtimes can yield a zero-length chunk; treat as inconclusive and keep reading briefly.
@@ -1509,7 +1513,7 @@ async function selectUpstreamResponseAny(upstreamUrls, headers, variants, debug 
     return { ok: false, status: 500, error: jsonError("Server misconfigured: empty upstream URL list", "server_error") };
   }
 
-  let firstErr = null;
+  let firstErr: any | null = null;
   for (const url of urls) {
     if (debug) logDebug(debug, reqId, "openai upstream try", { url });
     const sel = await selectUpstreamResponse(url, headers, variants, debug, reqId);
@@ -1870,7 +1874,7 @@ export async function handleOpenAIRequest({
     }
 
     const variants0 = responsesReqVariants(responsesReq, upstreamStream);
-    const variants = [];
+    const variants: any[] = [];
     if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
       for (const v0 of variants0) {
         if (!v0 || typeof v0 !== "object") continue;
@@ -2317,7 +2321,7 @@ export async function handleOpenAIRequest({
 	  if (!stream) {
 	    let fullText = "";
 	    let reasoningText = "";
-	    let responseId = null;
+	    let responseId: string | null = null;
 	    let sawDelta = false;
 	    let sawAnyText = false;
 	    let sawToolCall = false;
@@ -2514,7 +2518,7 @@ export async function handleOpenAIRequest({
   let chatId = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
   let created = Math.floor(Date.now() / 1000);
   let outModel = model;
-  let responseId = null;
+  let responseId: string | null = null;
   let sawDelta = false;
   let sentAnyText = false;
   let sawToolCall = false;
@@ -2782,7 +2786,7 @@ export async function handleOpenAIRequest({
               chatId = `chatcmpl_${ex.responseId}`;
             }
             if (typeof ex.model === "string" && ex.model) outModel = ex.model;
-            if (Number.isInteger(ex.createdAt)) created = ex.createdAt;
+            if (typeof ex.createdAt === "number" && Number.isInteger(ex.createdAt)) created = ex.createdAt;
             if (Array.isArray(ex.toolCalls)) {
               for (const c of ex.toolCalls) await upsertToolCall(c.call_id, c.name, c.arguments, "delta");
             }
@@ -3044,7 +3048,7 @@ export async function handleOpenAIResponsesUpstream({
   void startedAt;
 
   const variants0 = responsesReqVariants(bodyBase, upstreamStream);
-  const variants = [];
+  const variants: any[] = [];
   if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
     for (const v0 of variants0) {
       if (!v0 || typeof v0 !== "object") continue;

@@ -118,8 +118,8 @@ function claudeMessagesToOpenaiChatMessages(messages: any): any[] {
     }
 
     if (role === "assistant" && Array.isArray(content)) {
-      const toolCalls = [];
-      const nonToolBlocks = [];
+      const toolCalls: any[] = [];
+      const nonToolBlocks: any[] = [];
       for (const b of content) {
         if (!b || typeof b !== "object") continue;
         if (b.type === "tool_use") {

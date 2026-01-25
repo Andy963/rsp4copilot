@@ -50,7 +50,7 @@ function buildClaudeMessagesUrls(rawBase, messagesPathRaw) {
 
   const parts = value.split(",").map((p) => p.trim()).filter(Boolean);
 
-  const out = [];
+  const out: string[] = [];
   const pushUrl = (urlStr) => {
     if (!urlStr || typeof urlStr !== "string") return;
     if (!out.includes(urlStr)) out.push(urlStr);
@@ -97,7 +97,7 @@ function buildClaudeMessagesUrls(rawBase, messagesPathRaw) {
 }
 
 function openaiChatToClaudeMessages(messages) {
-  const claudeMessages = [];
+  const claudeMessages: any[] = [];
   let systemText = "";
 
   for (const msg of messages) {
@@ -126,7 +126,7 @@ function openaiChatToClaudeMessages(messages) {
     }
 
     const claudeRole = role === "assistant" ? "assistant" : "user";
-    const content = [];
+    const content: any[] = [];
 
     if (typeof msg.content === "string") {
       content.push({ type: "text", text: msg.content });
@@ -200,7 +200,7 @@ function claudeUsageToOpenaiUsage(usage) {
 
 function claudeExtractTextAndToolCalls(content) {
   let text = "";
-  const toolCalls = [];
+  const toolCalls: any[] = [];
 
   if (Array.isArray(content)) {
     for (const block of content) {
@@ -315,7 +315,7 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
     });
   }
 
-  let claudeResp = null;
+  let claudeResp: Response | null = null;
   let claudeUrl = "";
   let lastClaudeError = "";
   for (const url of claudeUrls) {
@@ -398,7 +398,7 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
   (async () => {
     const streamStartedAt = Date.now();
     let textContent = "";
-    const toolCalls = [];
+    const toolCalls: any[] = [];
     let finishReason = "stop";
     const emitReasoningDelta = async (deltaText) => {
       if (typeof deltaText !== "string" || !deltaText) return;
@@ -412,6 +412,7 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
       await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
     };
     try {
+      if (!claudeResp.body) throw new Error("Claude upstream returned an empty body");
       const reader = claudeResp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";

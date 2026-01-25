@@ -154,11 +154,11 @@ function mergeJsonSchemasShallow(base, next) {
   return out;
 }
 
-function jsonSchemaToGeminiSchema(jsonSchema, rootSchema = jsonSchema, refStack = undefined) {
+function jsonSchemaToGeminiSchema(jsonSchema, rootSchema = jsonSchema, refStack: Set<string> | undefined = undefined) {
   if (!jsonSchema || typeof jsonSchema !== "object") return {};
 
   const root = rootSchema && typeof rootSchema === "object" ? rootSchema : jsonSchema;
-  const stack = refStack instanceof Set ? refStack : new Set();
+  const stack = refStack && refStack instanceof Set ? refStack : new Set<string>();
 
   const ref = typeof jsonSchema.$ref === "string" ? jsonSchema.$ref.trim() : "";
   if (ref) {
@@ -295,7 +295,7 @@ function jsonSchemaToGeminiSchema(jsonSchema, rootSchema = jsonSchema, refStack 
 
     if (listSchemaFieldNames.has(k)) {
       if (Array.isArray(v)) {
-        const arr = [];
+        const arr: any[] = [];
         for (const it of v) {
           if (!it || typeof it !== "object") continue;
           if (it.type === "null") {
@@ -422,7 +422,7 @@ async function openaiImageToGeminiPart(imageValue, mimeTypeHint, fetchFn) {
 }
 
 async function openaiContentToGeminiParts(content, fetchFn) {
-  const parts = [];
+  const parts: any[] = [];
   const pushText = (text) => {
     if (typeof text !== "string") return;
     const t = text;
@@ -481,7 +481,7 @@ async function openaiContentToGeminiParts(content, fetchFn) {
 }
 
 function openaiToolsToGeminiFunctionDeclarations(tools) {
-  const out = [];
+  const out: any[] = [];
   const list = Array.isArray(tools) ? tools : [];
   for (const t of list) {
     if (!t || typeof t !== "object") continue;
@@ -525,7 +525,7 @@ function openaiToolChoiceToGeminiToolConfig(toolChoice) {
 
 function normalizeGeminiContents(rawContents, { requireUser = false } = {}) {
   const list = Array.isArray(rawContents) ? rawContents : [];
-  const out = [];
+  const out: any[] = [];
 
   for (const c0 of list) {
     if (!c0 || typeof c0 !== "object") continue;
@@ -535,7 +535,7 @@ function normalizeGeminiContents(rawContents, { requireUser = false } = {}) {
     const role = roleRaw && roleRaw.trim() ? roleRaw.trim() : "user";
 
     const partsIn = Array.isArray(c.parts) ? c.parts : [];
-    const partsOut = [];
+    const partsOut: any[] = [];
 
     for (const p0 of partsIn) {
       if (!p0 || typeof p0 !== "object") continue;
@@ -596,8 +596,8 @@ function normalizeGeminiContents(rawContents, { requireUser = false } = {}) {
 
 async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText, thoughtSigCache) {
   const messages = Array.isArray(reqJson?.messages) ? reqJson.messages : [];
-  const systemTextParts = [];
-  const contents = [];
+  const systemTextParts: string[] = [];
+  const contents: any[] = [];
   const toolNameByCallId = new Map();
   // Cache for looking up thought_signature by call_id
   const sigCache = thoughtSigCache && typeof thoughtSigCache === "object" ? thoughtSigCache : {};
@@ -664,12 +664,12 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
     }
 
     if (roleRaw === "assistant") {
-      const parts = [];
+      const parts: any[] = [];
       const txt = normalizeMessageContent(msg.content);
       if (txt && String(txt).trim()) parts.push({ text: String(txt) });
 
       const calls = normalizeToolCallsFromChatMessage(msg);
-      const callOrder = [];
+      const callOrder: any[] = [];
       for (const c of calls) {
         toolNameByCallId.set(c.call_id, c.name);
         callOrder.push({ call_id: c.call_id, name: c.name });
@@ -722,7 +722,7 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
 
         // Only emit functionResponses if the history actually includes tool messages for this turn.
         if (j > i + 1) {
-          const respParts = [];
+          const respParts: any[] = [];
           for (const c of callOrder) {
             const found = responsesByCallId.get(c.call_id);
             if (found) {
@@ -741,7 +741,7 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
 
     if (roleRaw === "tool") {
       // Best-effort: group consecutive tool results into a single turn.
-      const respParts = [];
+      const respParts: any[] = [];
       let j = i;
       while (j < messages.length) {
         const m2 = messages[j];
@@ -863,7 +863,7 @@ function geminiExtractTextAndToolCalls(respJson) {
   let text = "";
   let reasoning = "";
   let thoughtSummarySoFar = "";
-  const toolCalls = [];
+  const toolCalls: any[] = [];
 
   // Track the most recent thought/thought_signature for the next function call (2025 API)
   let pendingThought = "";
@@ -1101,7 +1101,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
 
   if (!stream) {
     const parseGeminiJson = async (resp) => {
-      let gjson = null;
+      let gjson: any | null = null;
       try {
         gjson = await resp.json();
       } catch {
@@ -1112,7 +1112,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
     };
 
     const shouldRetryEmpty = (extracted) => {
-      if (!extracted || typeof extracted !== "object") return false;
+      if (!extracted || typeof extracted !== "object") return true;
       const text0 = typeof extracted.text === "string" ? extracted.text.trim() : "";
       const reasoning0 = typeof extracted.reasoning === "string" ? extracted.reasoning.trim() : "";
       const toolCalls0 = Array.isArray(extracted.toolCalls) ? extracted.toolCalls : [];
@@ -1467,6 +1467,10 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
           toolCalls: Array.isArray(extracted2?.toolCalls) ? extracted2.toolCalls.length : 0,
         });
       }
+    }
+
+    if (!extracted || typeof extracted !== "object") {
+      return jsonResponse(502, jsonError("Gemini upstream returned an empty response", "bad_gateway"));
     }
 
     const { text, reasoning, toolCalls, finish_reason, usage } = extracted;

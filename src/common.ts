@@ -1,7 +1,7 @@
 export type Env = Record<string, string | undefined>;
 
-export function jsonResponse(status, obj, extraHeaders = undefined) {
-  const headers = {
+export function jsonResponse(status: number, obj: unknown, extraHeaders: Record<string, unknown> | undefined = undefined): Response {
+  const headers: Record<string, string> = {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "x-rsp4copilot": "1",
@@ -93,7 +93,7 @@ export function trimOpenAIChatMessages(messages: any, limits: any): any {
   let systemPrefixEnd = 0;
   while (systemPrefixEnd < list.length && isSystemRole(roleOf(list[systemPrefixEnd]))) systemPrefixEnd++;
 
-  const userIdxs = [];
+  const userIdxs: number[] = [];
   for (let i = systemPrefixEnd; i < list.length; i++) {
     if (roleOf(list[i]) === "user") userIdxs.push(i);
   }
@@ -248,7 +248,7 @@ export function trimOpenAIChatMessages(messages: any, limits: any): any {
     });
 
     const tryTruncateLargestText = () => {
-      let best = null;
+      let best: { obj: any; key: string; len: number } | null = null;
       for (const m of out) {
         if (!m || typeof m !== "object") continue;
         const content = m.content;
@@ -442,7 +442,7 @@ export function normalizeMessageContent(content) {
   if (content == null) return "";
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    const parts = [];
+    const parts: string[] = [];
     for (const item of content) {
       if (typeof item === "string") {
         parts.push(item);
@@ -464,7 +464,7 @@ export function normalizeMessageContent(content) {
 }
 
 export function normalizeToolCallsFromChatMessage(msg) {
-  const out = [];
+  const out: any[] = [];
   if (!msg || typeof msg !== "object") return out;
 
   const pushToolCall = (id, name, args, thoughtSignature, thought) => {
@@ -526,8 +526,8 @@ export function appendInstructions(base, extra) {
   return `${b}\n\n${e}`;
 }
 
-export function sseHeaders(extraHeaders = undefined) {
-  const headers = {
+export function sseHeaders(extraHeaders: Record<string, unknown> | undefined = undefined): Record<string, string> {
+  const headers: Record<string, string> = {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache",
     "x-accel-buffering": "no",

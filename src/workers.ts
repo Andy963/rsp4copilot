@@ -122,7 +122,7 @@ function withCors(resp: Response, corsHeaders: Record<string, string>): Response
   return new Response(resp.body, { status: resp.status || 200, headers });
 }
 
-async function readJsonBody(request: Request): Promise<{ ok: true; value: any } | { ok: false; value: null }> {
+async function readJsonBody(request: Request): Promise<{ ok: true; value: unknown } | { ok: false; value: null }> {
   try {
     return { ok: true, value: await request.json() };
   } catch {
