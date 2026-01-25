@@ -1855,7 +1855,7 @@ export async function handleOpenAIRequest({
     applyTemperatureTopPFromRequest(reqJson, responsesReq);
     if ("stop" in reqJson) responsesReq.stop = reqJson.stop;
 
-    const maxInputChars = Number.isInteger(limits?.maxInputChars) ? limits.maxInputChars : null;
+    const maxInputChars = limits.maxInputChars;
     if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
       const trimRes = trimOpenAIResponsesRequestToMaxChars(responsesReq, maxInputChars);
       if (debug && trimRes.trimmed) {
@@ -3026,7 +3026,7 @@ export async function handleOpenAIResponsesUpstream({
     else bodyBase.reasoning = { effort: reasoningEffort };
   }
 
-  const maxInputChars = Number.isInteger(limits?.maxInputChars) ? limits.maxInputChars : null;
+  const maxInputChars = limits.maxInputChars;
   if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
     const trimRes = trimOpenAIResponsesRequestToMaxChars(bodyBase, maxInputChars);
     if (debug && trimRes.trimmed) {

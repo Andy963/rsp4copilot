@@ -15,8 +15,8 @@ export function jsonResponse(status: number, obj: unknown, extraHeaders: Record<
   return new Response(JSON.stringify(obj), { status, headers });
 }
 
-export function jsonError(message, code = "bad_request") {
-  const c = typeof code === "string" ? code.trim().toLowerCase() : "";
+export function jsonError(message: string, code: string = "bad_request"): { error: { message: string; type: string; code: string } } {
+  const c = code.trim().toLowerCase();
   let type = "invalid_request_error";
   if (c === "server_error") type = "server_error";
   else if (c === "bad_gateway") type = "server_error";
@@ -31,7 +31,7 @@ export function joinUrls(urls: unknown): string {
   return list.join(",");
 }
 
-export function parseBoolEnv(value) {
+export function parseBoolEnv(value: unknown): boolean {
   const v = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (!v) return false;
   return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on";
@@ -41,7 +41,7 @@ export const DEFAULT_RSP4COPILOT_MAX_TURNS = 40;
 export const DEFAULT_RSP4COPILOT_MAX_MESSAGES = 200;
 export const DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS = 300000;
 
-function parseIntEnv(raw, fallback) {
+function parseIntEnv(raw: unknown, fallback: number): number {
   if (typeof raw !== "string") return fallback;
   const s = raw.trim();
   if (!s) return fallback;
@@ -50,7 +50,7 @@ function parseIntEnv(raw, fallback) {
   return n;
 }
 
-export function getRsp4CopilotLimits(env) {
+export function getRsp4CopilotLimits(env: Env): { maxTurns: number; maxMessages: number; maxInputChars: number } {
   const defaultMaxInputChars = parseIntEnv(env?.DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS, DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS);
   return {
     maxTurns: parseIntEnv(env?.RSP4COPILOT_MAX_TURNS, DEFAULT_RSP4COPILOT_MAX_TURNS),
@@ -59,7 +59,7 @@ export function getRsp4CopilotLimits(env) {
   };
 }
 
-function estimateJsonChars(value) {
+function estimateJsonChars(value: unknown): number {
   try {
     return JSON.stringify(value).length;
   } catch {
@@ -67,7 +67,7 @@ function estimateJsonChars(value) {
   }
 }
 
-export function measureOpenAIChatMessages(messages) {
+export function measureOpenAIChatMessages(messages: unknown): { turns: number; messages: number; inputChars: number } {
   const list = Array.isArray(messages) ? messages : [];
   let turns = 0;
   let inputChars = 0;
@@ -294,11 +294,11 @@ export function trimOpenAIChatMessages(messages: any, limits: any): any {
   return { ok: true, messages: out, trimmed, before, after, droppedTurns, droppedSystem, droppedTail, truncatedInputChars };
 }
 
-export function isDebugEnabled(env) {
+export function isDebugEnabled(env: Env): boolean {
   return parseBoolEnv(typeof env?.RSP4COPILOT_DEBUG === "string" ? env.RSP4COPILOT_DEBUG : "");
 }
 
-export function maskSecret(value) {
+export function maskSecret(value: unknown): string {
   const v = typeof value === "string" ? value : value == null ? "" : String(value);
   if (!v) return "";
   const s = v.trim();
@@ -307,15 +307,15 @@ export function maskSecret(value) {
   return `${s.slice(0, 4)}…${s.slice(-4)} (len=${s.length})`;
 }
 
-export function previewString(value, maxLen = 1200) {
+export function previewString(value: unknown, maxLen: number = 1200): string {
   const v = typeof value === "string" ? value : value == null ? "" : String(value);
   if (!v) return "";
   if (v.length <= maxLen) return v;
   return `${v.slice(0, maxLen)}…(truncated,len=${v.length})`;
 }
 
-export function redactHeadersForLog(headers) {
-  const out = {};
+export function redactHeadersForLog(headers: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
   const h = headers && typeof headers === "object" ? headers : {};
   for (const [k, v] of Object.entries(h)) {
     const key = String(k || "");
@@ -329,9 +329,9 @@ export function redactHeadersForLog(headers) {
   return out;
 }
 
-export function safeJsonStringifyForLog(value, maxStringLen = 800) {
-  const seen = new WeakSet();
-  const isSensitiveKey = (keyLower) =>
+export function safeJsonStringifyForLog(value: unknown, maxStringLen: number = 800): string {
+  const seen = new WeakSet<object>();
+  const isSensitiveKey = (keyLower: string) =>
     keyLower === "authorization" ||
     keyLower.includes("api_key") ||
     keyLower.endsWith("api-key") ||
@@ -342,10 +342,11 @@ export function safeJsonStringifyForLog(value, maxStringLen = 800) {
     keyLower.includes("passwd") ||
     keyLower.includes("secret");
 
-  return JSON.stringify(value, (key, v) => {
+  return JSON.stringify(value, (key: string, v: any) => {
     if (v && typeof v === "object") {
-      if (seen.has(v)) return "[Circular]";
-      seen.add(v);
+      const obj = v as object;
+      if (seen.has(obj)) return "[Circular]";
+      seen.add(obj);
       return v;
     }
     if (typeof v === "string") {
@@ -357,7 +358,7 @@ export function safeJsonStringifyForLog(value, maxStringLen = 800) {
   });
 }
 
-export function logDebug(enabled, reqId, label, data) {
+export function logDebug(enabled: boolean, reqId: string, label: string, data: unknown = undefined): void {
   if (!enabled) return;
   const prefix = reqId ? `[rsp4copilot][${reqId}]` : "[rsp4copilot]";
   if (data === undefined) {
@@ -367,7 +368,7 @@ export function logDebug(enabled, reqId, label, data) {
   }
 }
 
-export function normalizeAuthValue(raw) {
+export function normalizeAuthValue(raw: unknown): string {
   if (typeof raw !== "string") return "";
   let value = raw.trim();
   if (!value) return "";
@@ -387,8 +388,8 @@ export function normalizeAuthValue(raw) {
   return value;
 }
 
-export function getWorkerAuthKeys(env) {
-  const keys = new Set();
+export function getWorkerAuthKeys(env: Env): string[] {
+  const keys = new Set<string>();
 
   const single = normalizeAuthValue(env?.WORKER_AUTH_KEY);
   if (single) keys.add(single);
@@ -402,15 +403,15 @@ export function getWorkerAuthKeys(env) {
   return Array.from(keys);
 }
 
-export function bearerToken(headerValue) {
+export function bearerToken(headerValue: unknown): string | null {
   if (!headerValue || typeof headerValue !== "string") return null;
   const value = headerValue.trim();
   if (value.toLowerCase().startsWith("bearer ")) return value.slice(7).trim();
   return null;
 }
 
-export function normalizeBaseUrl(raw) {
-  const base = (raw || "").trim();
+export function normalizeBaseUrl(raw: unknown): string {
+  const base = String(raw ?? "").trim();
   if (!base) return base;
   const lower = base.toLowerCase();
   if (lower === "http" || lower === "http:" || lower === "https" || lower === "https:") return "";
@@ -418,15 +419,15 @@ export function normalizeBaseUrl(raw) {
   return `https://${base}`;
 }
 
-export function joinPathPrefix(prefixPath, suffixPath) {
-  const p = (prefixPath || "").replace(/\/+$/, "");
-  const s0 = (suffixPath || "").trim();
+export function joinPathPrefix(prefixPath: unknown, suffixPath: unknown): string {
+  const p = String(prefixPath ?? "").replace(/\/+$/, "");
+  const s0 = String(suffixPath ?? "").trim();
   const s = s0.startsWith("/") ? s0 : `/${s0}`;
   if (!p || p === "/") return s;
   return `${p}${s}`;
 }
 
-export function applyTemperatureTopPFromRequest(reqJson, target) {
+export function applyTemperatureTopPFromRequest(reqJson: any, target: any): void {
   if (!reqJson || typeof reqJson !== "object") return;
   if (!target || typeof target !== "object") return;
 
@@ -450,7 +451,7 @@ export function applyTemperatureTopPFromRequest(reqJson, target) {
   if (hasTopP) target.top_p = reqJson.top_p;
 }
 
-export function normalizeMessageContent(content) {
+export function normalizeMessageContent(content: unknown): string {
   if (content == null) return "";
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -471,11 +472,11 @@ export function normalizeMessageContent(content) {
     }
     return parts.join("");
   }
-  if (content && typeof content === "object" && typeof content.text === "string") return content.text;
+  if (content && typeof content === "object" && "text" in content && typeof (content as any).text === "string") return (content as any).text;
   return String(content);
 }
 
-export function normalizeToolCallsFromChatMessage(msg) {
+export function normalizeToolCallsFromChatMessage(msg: any): any[] {
   const out: any[] = [];
   if (!msg || typeof msg !== "object") return out;
 
@@ -529,7 +530,7 @@ export function normalizeToolCallsFromChatMessage(msg) {
   return out;
 }
 
-export function appendInstructions(base, extra) {
+export function appendInstructions(base: unknown, extra: unknown): string {
   const b = typeof base === "string" ? base.trim() : "";
   const e = typeof extra === "string" ? extra.trim() : "";
   if (!e) return b;
@@ -554,11 +555,11 @@ export function sseHeaders(extraHeaders: Record<string, unknown> | undefined = u
   return headers;
 }
 
-export function encodeSseData(dataStr) {
+export function encodeSseData(dataStr: string): string {
   return `data: ${dataStr}\n\n`;
 }
 
-export async function sha256Hex(input) {
+export async function sha256Hex(input: unknown): Promise<string> {
   const bytes = new TextEncoder().encode(String(input ?? ""));
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest))
@@ -566,7 +567,7 @@ export async function sha256Hex(input) {
     .join("");
 }
 
-export function getSessionKey(request, reqJson, token) {
+export function getSessionKey(request: Request, reqJson: any, token: string): string {
   const headerKey = request.headers.get("x-session-id");
   if (typeof headerKey === "string" && headerKey.trim()) return headerKey.trim();
   const user = reqJson?.user;

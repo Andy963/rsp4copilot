@@ -256,18 +256,18 @@ if (rawModel.includes(".")) {
 
 ---
 
-### 13. 部分函数缺少类型注解
+### 13. 部分函数缺少类型注解（已改进）
 
 **文件**: `src/common.ts`
 
 **示例**:
 ```typescript
-export function jsonError(message, code = "bad_request") {
-  // 参数缺少类型注解
+export function jsonError(message: string, code: string = "bad_request") {
+  // 已补齐类型注解
 }
 ```
 
-**建议**: 为对外导出的 helper（如 `jsonError` / `parseBoolEnv` 等）逐步补齐参数/返回值类型，提高可读性与 IDE 提示
+**结论**: 已为 `common.ts` 内大部分对外导出的 helper 补齐参数/返回值类型，提高可读性与 IDE 提示
 
 **位置**: [src/common.ts#L18](file:///home/andy/rsp4copilot/src/common.ts#L18)
 
