@@ -13,7 +13,18 @@
  */
 
 import type { Env } from "./common";
-import { bearerToken, getWorkerAuthKeys, isDebugEnabled, jsonError, jsonResponse, logDebug, normalizeAuthValue, previewString, sseHeaders } from "./common";
+import {
+  bearerToken,
+  getWorkerAuthKeys,
+  isDebugEnabled,
+  jsonError,
+  jsonResponse,
+  logDebug,
+  maskSecret,
+  normalizeAuthValue,
+  previewString,
+  sseHeaders,
+} from "./common";
 import { claudeMessagesRequestToOpenaiChat, handleClaudeCountTokens, openaiChatResponseToClaudeMessage, openaiStreamToClaudeMessagesSse } from "./claude_api";
 import { getProviderApiKey, parseGatewayConfig } from "./config";
 import { dispatchOpenAIChatToProvider } from "./dispatch";
@@ -64,6 +75,37 @@ function mergeVary(existing: string, incoming: string): string {
   add(existing);
   add(incoming);
   return out.join(", ");
+}
+
+function redactUrlSearchForLog(url: URL): string {
+  const params = url?.searchParams;
+  if (!params) return "";
+
+  const isSensitiveKey = (keyLower: string) =>
+    keyLower === "authorization" ||
+    keyLower.includes("api_key") ||
+    keyLower.endsWith("api-key") ||
+    keyLower.endsWith("_key") ||
+    keyLower.endsWith("key") ||
+    keyLower.includes("token") ||
+    keyLower.includes("password") ||
+    keyLower.includes("passwd") ||
+    keyLower.includes("secret");
+
+  const out = new URLSearchParams();
+  let count = 0;
+  for (const [k, v] of params.entries()) {
+    if (count++ >= 40) {
+      out.append("__truncated__", "1");
+      break;
+    }
+    const keyLower = String(k || "").toLowerCase();
+    const safeVal = isSensitiveKey(keyLower) ? maskSecret(v) : previewString(v, 200);
+    out.append(k, safeVal);
+  }
+
+  const s = out.toString();
+  return s ? `?${s}` : "";
 }
 
 function withCors(resp: Response, corsHeaders: Record<string, string>): Response {
@@ -139,7 +181,7 @@ export default {
           method: request.method,
           host: url.host,
           path,
-          search: url.search || "",
+          search: redactUrlSearchForLog(url),
           userAgent: request.headers.get("user-agent") || "",
           cfRay: request.headers.get("cf-ray") || "",
           hasAuthorization: Boolean(authHeader),
