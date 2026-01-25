@@ -5,9 +5,6 @@ export function jsonResponse(status, obj, extraHeaders = undefined) {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "x-rsp4copilot": "1",
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-allow-headers": "*",
   };
   if (extraHeaders && typeof extraHeaders === "object") {
     for (const [k, v] of Object.entries(extraHeaders)) {
@@ -535,9 +532,6 @@ export function sseHeaders(extraHeaders = undefined) {
     "cache-control": "no-cache",
     "x-accel-buffering": "no",
     "x-rsp4copilot": "1",
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-allow-headers": "*",
   };
   if (extraHeaders && typeof extraHeaders === "object") {
     for (const [k, v] of Object.entries(extraHeaders)) {

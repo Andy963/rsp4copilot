@@ -28,21 +28,54 @@ import { openAIChatSseToGeminiSse, openAIChatSseToResponsesSse } from "./protoco
 function getCorsHeaders(request: Request): Record<string, string> {
   const origin = request.headers.get("origin") || "";
   const allowOrigin = origin && typeof origin === "string" ? origin : "*";
+
+  const reqHeaders = request.headers.get("access-control-request-headers") || "";
+  const allowHeaders =
+    typeof reqHeaders === "string" && reqHeaders.trim()
+      ? reqHeaders
+      : "authorization,content-type,x-session-id,x-api-key,x-goog-api-key,anthropic-api-key,x-anthropic-api-key,anthropic-version,anthropic-beta";
+
+  const vary = typeof reqHeaders === "string" && reqHeaders.trim() ? "Origin, Access-Control-Request-Headers" : "Origin";
   return {
     "access-control-allow-origin": allowOrigin,
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers":
-      "authorization,content-type,x-session-id,x-api-key,x-goog-api-key,anthropic-api-key,x-anthropic-api-key,anthropic-version,anthropic-beta",
+    "access-control-allow-headers": allowHeaders,
     "access-control-max-age": "86400",
-    vary: "Origin",
+    vary,
   };
+}
+
+function mergeVary(existing: string, incoming: string): string {
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (value: string) => {
+    for (const part of String(value || "")
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean)) {
+      const key = part.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(part);
+    }
+  };
+
+  add(existing);
+  add(incoming);
+  return out.join(", ");
 }
 
 function withCors(resp: Response, corsHeaders: Record<string, string>): Response {
   const headers = new Headers(resp.headers);
   for (const [k, v] of Object.entries(corsHeaders || {})) {
     if (v == null) continue;
-    if (!headers.has(k)) headers.set(k, v);
+    if (k.toLowerCase() === "vary") {
+      const existing = headers.get("vary") || "";
+      headers.set("vary", existing ? mergeVary(existing, String(v)) : String(v));
+      continue;
+    }
+    headers.set(k, String(v));
   }
   return new Response(resp.body, { status: resp.status || 200, headers });
 }
