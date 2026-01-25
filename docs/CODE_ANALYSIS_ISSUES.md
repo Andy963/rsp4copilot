@@ -187,22 +187,22 @@ export function jsonError(message, code = "bad_request") {
 
 ---
 
-### 9. JSONC 解析的边界情况
+### 9. JSONC 解析的边界情况（已改进）
 
 **文件**: `src/jsonc.ts`
 
 **代码**:
 ```typescript
-s = s.replace(/(^|[^:])\/\/.*$/gm, "$1");
+// Strip // and /* */ comments (string-aware) + trailing commas
+// (see src/jsonc.ts)
 ```
 
 **分析**:
-- 尝试避开 `://`（如 `https://`）
-- 对于配置文件来说，字符串内的 `//` 场景很少见
-- 这是 **best-effort** 的 JSONC 解析，不是标准 JSON5 解析器
-- 实际使用中不太可能遇到问题
+- 旧实现基于正则，可能在字符串里误删 `//` 或误删类似 `",]` 的内容
+- 现已改为小型状态机：仅在 **非字符串** 状态下移除注释，并在同样条件下移除尾逗号
+- 兼容性更接近 JSONC，减少配置解析的踩坑概率
 
-**位置**: [src/jsonc.ts#L12](file:///home/andy/rsp4copilot/src/jsonc.ts#L12)
+**位置**: [src/jsonc.ts#L1](file:///home/andy/rsp4copilot/src/jsonc.ts#L1)
 
 ---
 
