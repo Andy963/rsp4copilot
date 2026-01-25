@@ -26,6 +26,11 @@ export function jsonError(message, code = "bad_request") {
   return { error: { message, type, code } };
 }
 
+export function joinUrls(urls: unknown): string {
+  const list = Array.isArray(urls) ? urls.map((u) => String(u ?? "").trim()).filter(Boolean) : [];
+  return list.join(",");
+}
+
 export function parseBoolEnv(value) {
   const v = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (!v) return false;

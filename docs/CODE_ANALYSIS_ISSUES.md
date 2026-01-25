@@ -17,18 +17,13 @@
 
 ## 🔴 确认存在的问题
 
-### 1. CORS 策略重复定义（设计问题，非漏洞）
+### 1. CORS 策略重复定义（已修复）
 
 **文件**: `src/common.ts`, `src/workers.ts`
 
 **问题描述**:
-- `common.ts` 中的 `jsonResponse()` (L8-10) 和 `sseHeaders()` (L538-540) 硬编码了 CORS 头:
-  ```typescript
-  "access-control-allow-origin": "*",
-  "access-control-allow-headers": "*",
-  ```
-- `workers.ts` 中的 `withCors()` (L45) 使用逻辑 `if (!headers.has(k)) headers.set(k, v)`
-- 这导致 `workers.ts/getCorsHeaders()` 中的策略（反射 origin、限制 header 列表）**不会生效**
+- 早期版本在 `common.ts/jsonResponse()` 与 `sseHeaders()` 硬编码 `access-control-*`，会覆盖 `workers.ts` 中的动态 CORS 策略
+- 现已将 CORS 头统一到 `workers.ts/getCorsHeaders()` + `withCors()`，`common.ts` 不再写入 CORS 头，从而避免策略冲突
 
 **实际影响**:
 - 这是一个 **API 网关**，通常不会从浏览器直接调用
@@ -36,13 +31,12 @@
 - 但如果作为浏览器端 SDK 的后端使用，这是一个需要注意的设计问题
 
 **位置**:
-- [src/common.ts#L8-L10](file:///home/andy/rsp4copilot/src/common.ts#L8-L10)
-- [src/common.ts#L538-L540](file:///home/andy/rsp4copilot/src/common.ts#L538-L540)
-- [src/workers.ts#L45](file:///home/andy/rsp4copilot/src/workers.ts#L45)
+- [src/workers.ts#L39](file:///home/andy/rsp4copilot/src/workers.ts#L39)
+- [src/workers.ts#L111](file:///home/andy/rsp4copilot/src/workers.ts#L111)
 
 ---
 
-### 2. URL Query 参数中允许传递认证 Key（Gemini 兼容性设计）
+### 2. URL Query 参数中允许传递认证 Key（已确认无需修复）
 
 **文件**: `src/workers.ts`
 
@@ -52,24 +46,21 @@ if (!token && path.startsWith("/gemini/")) token = url.searchParams.get("key");
 ```
 
 **分析**:
-- 这是为了兼容 Gemini API 的标准调用方式（Gemini SDK 使用 `?key=` 传递 API key）
+- 这是 Gemini API 的标准/常见调用方式（官方示例与部分 SDK 使用 `?key=`）
 - **仅限于 `/gemini/` 路径**，其他路径不支持
-- 风险：Query 参数可能出现在日志中
 
-**建议**:
-- 可以保留此功能以兼容 Gemini 客户端
-- 文档中提醒用户注意日志脱敏
+**结论**: 兼容性所需，按设计保留，无需修复
 
-**位置**: [src/workers.ts#L137](file:///home/andy/rsp4copilot/src/workers.ts#L137)
+**位置**: [src/workers.ts#L212](file:///home/andy/rsp4copilot/src/workers.ts#L212)
 
 ---
 
-### 3. TypeScript strict 模式关闭 + any 类型使用
+### 3. TypeScript strict 模式关闭 + any 类型使用（已改进）
 
 **文件**: `tsconfig.json`, 所有源文件
 
 **问题描述**:
-- `tsconfig.json` 中 `strict: false`
+- 早期 `tsconfig.json` 中 `strict: false`
 - 代码中使用 `any` 类型处理 JSON 解析结果
 
 **分析**:
@@ -77,11 +68,14 @@ if (!token && path.startsWith("/gemini/")) token = url.searchParams.get("key");
 - 代码中有大量运行时类型检查（`typeof x === "string"` 等）
 - 这是一个**代码质量/维护性**问题，不是安全问题
 
-**建议**:
-- 逐步为关键接口添加类型定义
-- 考虑使用 zod 或类似库做运行时验证
+**现状**:
+- 已启用 `strict: true`，但为了协议转换的动态 JSON 处理仍保留部分 `any`（并设置 `noImplicitAny: false`）
 
-**位置**: [tsconfig.json#L8](file:///home/andy/rsp4copilot/tsconfig.json#L8)
+**建议**:
+- 逐步为关键接口添加类型定义（优先出入参边界）
+- 需要更强运行时校验时，可考虑 zod / valibot 等
+
+**位置**: [tsconfig.json#L7](file:///home/andy/rsp4copilot/tsconfig.json#L7)
 
 ---
 
@@ -143,20 +137,19 @@ if (!token) token = request.headers.get("x-anthropic-api-key");
 
 ---
 
-### 7. OpenAI->Claude 流式转换简化
+### 7. OpenAI->Claude 流式转换简化（已改进）
 
 **文件**: `src/claude_api.ts`
 
 **问题描述**:
-- `openaiStreamToClaudeMessagesSse` 主要转换 `delta.content`
+- 早期实现主要转换 `delta.content`
 - 工具调用等高级功能的流式转换可能不完整
 
 **分析**:
-- 这是 **功能完整性** 问题，不是 bug
-- 基本的文本流式转换是正常工作的
-- 如果需要完整的 tool_calls 流式转换，需要增强
+- 已在 `openaiStreamToClaudeMessagesSse` 中补全 `delta.tool_calls`：转换为 Claude SSE 的 `tool_use` content blocks，并用 `input_json_delta` 透传参数增量
+- 这是兼容层的 best-effort 实现，但核心的文本/工具调用流式信息已不再丢失
 
-**位置**: [src/claude_api.ts#L244-L341](file:///home/andy/rsp4copilot/src/claude_api.ts#L244-L341)
+**位置**: [src/claude_api.ts#L305](file:///home/andy/rsp4copilot/src/claude_api.ts#L305)
 
 ---
 
@@ -250,34 +243,33 @@ if (rawModel.includes(".")) {
 
 ## 🟡 代码质量建议 (Code Quality)
 
-### 12. joinUrls 函数重复定义
+### 12. joinUrls 函数重复定义（已修复）
 
-**文件**: `src/workers.ts`, `src/dispatch.ts`
+**文件**: `src/common.ts`, `src/workers.ts`, `src/dispatch.ts`
 
-**描述**: `joinUrls` 函数在两个文件中有相同实现
+**描述**: `joinUrls` 曾在 `workers.ts` 和 `dispatch.ts` 中重复定义，现已抽取到 `common.ts` 并统一复用
 
-**建议**: 抽取到 `common.ts`
+**结论**: 已抽取到 `common.ts`，重复实现已移除
 
 **位置**: 
-- [src/workers.ts#L58-L61](file:///home/andy/rsp4copilot/src/workers.ts#L58-L61)
-- [src/dispatch.ts#L9-L12](file:///home/andy/rsp4copilot/src/dispatch.ts#L9-L12)
+- [src/common.ts#L29](file:///home/andy/rsp4copilot/src/common.ts#L29)
 
 ---
 
-### 13. 函数缺少类型注解
+### 13. 部分函数缺少类型注解
 
 **文件**: `src/common.ts`
 
 **示例**:
 ```typescript
-export function jsonResponse(status, obj, extraHeaders = undefined) {
-  // 参数和返回值缺少类型
+export function jsonError(message, code = "bad_request") {
+  // 参数缺少类型注解
 }
 ```
 
-**建议**: 添加明确的类型注解提高代码可读性
+**建议**: 为对外导出的 helper（如 `jsonError` / `parseBoolEnv` 等）逐步补齐参数/返回值类型，提高可读性与 IDE 提示
 
-**位置**: [src/common.ts#L3](file:///home/andy/rsp4copilot/src/common.ts#L3)
+**位置**: [src/common.ts#L18](file:///home/andy/rsp4copilot/src/common.ts#L18)
 
 ---
 
@@ -310,9 +302,7 @@ function modelIdForList(models, entry) {
 
 | 问题 | 严重程度 | 说明 |
 |------|---------|------|
-| CORS 策略重复定义 | 低 | `common.ts` 和 `workers.ts` 定义冲突，但不影响安全 |
-| TypeScript strict:false | 低 | 代码质量问题，有运行时检查补偿 |
-| OpenAI->Claude 流式转换简化 | 低 | 功能完整性问题，基本场景正常工作 |
+| any 类型使用（noImplicitAny:false） | 低 | 已启用 strict，但仍允许隐式 any 以便处理动态协议 JSON |
 
 ### 代码亮点：
 

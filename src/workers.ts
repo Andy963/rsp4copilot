@@ -17,6 +17,7 @@ import {
   bearerToken,
   getWorkerAuthKeys,
   isDebugEnabled,
+  joinUrls,
   jsonError,
   jsonResponse,
   logDebug,
@@ -128,11 +129,6 @@ async function readJsonBody(request: Request): Promise<{ ok: true; value: unknow
   } catch {
     return { ok: false, value: null };
   }
-}
-
-function joinUrls(urls: unknown): string {
-  const list = Array.isArray(urls) ? urls.map((u) => String(u ?? "").trim()).filter(Boolean) : [];
-  return list.join(",");
 }
 
 function copilotToolUseInstructionsText(): string {

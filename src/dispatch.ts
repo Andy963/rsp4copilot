@@ -1,15 +1,10 @@
-import { jsonError, jsonResponse, normalizeAuthValue } from "./common";
+import { joinUrls, jsonError, jsonResponse, normalizeAuthValue } from "./common";
 import type { Env } from "./common";
 import type { GatewayConfig, ModelConfig, ProviderConfig } from "./config";
 import { getProviderApiKey } from "./config";
 import { handleClaudeChatCompletions } from "./providers/claude";
 import { handleGeminiChatCompletions } from "./providers/gemini";
 import { handleOpenAIChatCompletionsUpstream, handleOpenAIRequest } from "./providers/openai";
-
-function joinUrls(urls: unknown): string {
-  const list = Array.isArray(urls) ? urls.map((u) => String(u ?? "").trim()).filter(Boolean) : [];
-  return list.join(",");
-}
 
 function envWithOverrides(env: Env, overrides: Record<string, string> | null): Env {
   const base = env && typeof env === "object" ? env : {};
