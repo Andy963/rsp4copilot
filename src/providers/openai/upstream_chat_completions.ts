@@ -1,4 +1,5 @@
 import { jsonError, jsonResponse, logDebug, normalizeAuthValue, redactHeadersForLog, sseHeaders } from "../../common";
+import { SseTextStreamParser } from "../../protocols/stream/sse";
 import { selectUpstreamResponseAny } from "./upstream_select";
 import { buildChatCompletionsUrls } from "./urls";
 
@@ -70,11 +71,60 @@ export async function handleOpenAIChatCompletionsUpstream({
 
   const resp = sel.resp;
   if (stream) {
-    return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
+    const ct = (resp.headers.get("content-type") || "").toLowerCase();
+    if (!ct.includes("text/event-stream") || !resp.body) {
+      return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
+    }
+
+    // Some OpenAI-compatible gateways may close the stream without emitting `data: [DONE]`.
+    // Ensure we always terminate the SSE stream with `[DONE]` so clients that rely on it can finish.
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    (async () => {
+      const reader = resp.body!.getReader();
+      const decoder = new TextDecoder();
+      const sse = new SseTextStreamParser();
+      let sawDone = false;
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunkText = decoder.decode(value, { stream: true });
+          for (const evt of sse.push(chunkText)) {
+            if (evt.data === "[DONE]") sawDone = true;
+          }
+          await writer.write(encoder.encode(chunkText));
+        }
+
+        for (const evt of sse.finish()) {
+          if (evt.data === "[DONE]") sawDone = true;
+        }
+
+        if (!sawDone) {
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+        }
+      } catch {
+        // Best-effort: if upstream ends unexpectedly, still try to close the client stream.
+        try {
+          if (!sawDone) await writer.write(encoder.encode("data: [DONE]\n\n"));
+        } catch {}
+      } finally {
+        try {
+          await reader.cancel();
+        } catch {}
+        try {
+          await writer.close();
+        } catch {}
+      }
+    })();
+
+    return new Response(readable, { status: resp.status, headers: sseHeaders() });
   }
 
   const text = await resp.text();
   const outHeaders = { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" };
   return new Response(text, { status: resp.status, headers: outHeaders });
 }
-
