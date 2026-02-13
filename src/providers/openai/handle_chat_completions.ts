@@ -24,6 +24,7 @@ import { getSessionPreviousResponseId, setSessionPreviousResponseId } from "./se
 import { applyCachedThoughtSignaturesToResponsesRequest, getResponsesThoughtSignatureCache, setResponsesThoughtSignatureCache } from "./thought_signature_cache";
 import { selectUpstreamResponseAny } from "./upstream_select";
 import { handleOpenAIChatCompletionsViaResponsesStream } from "./handle_chat_completions_stream";
+import { SseTextStreamParser } from "../../protocols/stream/sse";
 
 function hasAssistantMessage(messages: any): boolean {
   for (const m of Array.isArray(messages) ? messages : []) {
@@ -254,83 +255,93 @@ export async function handleOpenAIChatCompletionsViaResponses({
     };
     const reader = sel.resp.body!.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    const sse = new SseTextStreamParser();
     let finished = false;
+    const handleEventData = (data: string): boolean => {
+      if (!data) return false;
+      sawDataLine = true;
+      if (data === "[DONE]") return true;
+
+      let payload: any;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        return false;
+      }
+
+      collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
+      const evt = payload?.type;
+      if (evt === "response.created" && payload?.response && typeof payload.response === "object") {
+        const rid = payload.response.id;
+        if (typeof rid === "string" && rid) responseId = rid;
+        return false;
+      }
+      if (evt === "response.function_call_arguments.delta") {
+        upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.delta, "delta");
+        return false;
+      }
+      if (evt === "response.function_call_arguments.done" || evt === "response.function_call.done") {
+        upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.arguments, "full");
+        return false;
+      }
+      if ((evt === "response.output_item.added" || evt === "response.output_item.done") && payload?.item && typeof payload.item === "object") {
+        const item = payload.item;
+        if (item?.type === "function_call") {
+          upsertToolCall(item.call_id ?? item.callId ?? item.id, item.name ?? item.function?.name, item.arguments ?? item.function?.arguments, "full");
+        }
+        return false;
+      }
+      if ((evt === "response.reasoning.delta" || evt === "response.reasoning_summary.delta") && typeof payload.delta === "string") {
+        reasoningText += payload.delta;
+        return false;
+      }
+      if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string") {
+        sawDelta = true;
+        sawAnyText = true;
+        fullText += payload.delta;
+        return false;
+      }
+      if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string") {
+        sawAnyText = true;
+        fullText += payload.text;
+        return false;
+      }
+      if (evt === "response.completed" && payload?.response && typeof payload.response === "object") {
+        const rid = payload.response.id;
+        if (!responseId && typeof rid === "string" && rid) responseId = rid;
+        if (!sawDelta && !sawAnyText) {
+          const t = extractOutputTextFromResponsesResponse(payload.response);
+          if (t) {
+            sawAnyText = true;
+            fullText += t;
+          }
+        }
+        const calls = extractToolCallsFromResponsesResponse(payload.response);
+        for (const c of calls) upsertToolCall(c.call_id, c.name, c.arguments, "full");
+        return true;
+      }
+      if (evt === "response.failed") {
+        return true;
+      }
+
+      return false;
+    };
     while (!finished) {
       const { done, value } = await reader.read();
       if (done) break;
       const chunkText = decoder.decode(value, { stream: true });
       raw += chunkText;
-      buf += chunkText;
-      const lines = buf.split("\n");
-      buf = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        sawDataLine = true;
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") {
+      const events = sse.push(chunkText);
+      for (const evt0 of events) {
+        if (handleEventData(evt0.data)) {
           finished = true;
           break;
         }
-        let payload: any;
-        try {
-          payload = JSON.parse(data);
-        } catch {
-          continue;
-        }
-        collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
-        const evt = payload?.type;
-        if (evt === "response.created" && payload?.response && typeof payload.response === "object") {
-          const rid = payload.response.id;
-          if (typeof rid === "string" && rid) responseId = rid;
-          continue;
-        }
-        if (evt === "response.function_call_arguments.delta") {
-          upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.delta, "delta");
-          continue;
-        }
-        if (evt === "response.function_call_arguments.done" || evt === "response.function_call.done") {
-          upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.arguments, "full");
-          continue;
-        }
-        if ((evt === "response.output_item.added" || evt === "response.output_item.done") && payload?.item && typeof payload.item === "object") {
-          const item = payload.item;
-          if (item?.type === "function_call") {
-            upsertToolCall(item.call_id ?? item.callId ?? item.id, item.name ?? item.function?.name, item.arguments ?? item.function?.arguments, "full");
-          }
-          continue;
-        }
-        if ((evt === "response.reasoning.delta" || evt === "response.reasoning_summary.delta") && typeof payload.delta === "string") {
-          reasoningText += payload.delta;
-          continue;
-        }
-        if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string") {
-          sawDelta = true;
-          sawAnyText = true;
-          fullText += payload.delta;
-          continue;
-        }
-        if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string") {
-          sawAnyText = true;
-          fullText += payload.text;
-          continue;
-        }
-        if (evt === "response.completed" && payload?.response && typeof payload.response === "object") {
-          const rid = payload.response.id;
-          if (!responseId && typeof rid === "string" && rid) responseId = rid;
-          if (!sawDelta && !sawAnyText) {
-            const t = extractOutputTextFromResponsesResponse(payload.response);
-            if (t) {
-              sawAnyText = true;
-              fullText += t;
-            }
-          }
-          const calls = extractToolCallsFromResponsesResponse(payload.response);
-          for (const c of calls) upsertToolCall(c.call_id, c.name, c.arguments, "full");
-          finished = true;
-          break;
-        }
-        if (evt === "response.failed") {
+      }
+    }
+    if (!finished) {
+      for (const evt0 of sse.finish()) {
+        if (handleEventData(evt0.data)) {
           finished = true;
           break;
         }
@@ -428,4 +439,3 @@ export async function handleOpenAIChatCompletionsViaResponses({
     startedAt,
   });
 }
-

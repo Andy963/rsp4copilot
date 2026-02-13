@@ -8,6 +8,7 @@ import {
 } from "./responses_extract";
 import { setSessionPreviousResponseId } from "./session_cache";
 import { setResponsesThoughtSignatureCache } from "./thought_signature_cache";
+import { SseTextStreamParser } from "../../protocols/stream/sse";
 
 export function handleOpenAIChatCompletionsViaResponsesStream({
   upstreamResp,
@@ -140,146 +141,163 @@ export function handleOpenAIChatCompletionsViaResponsesStream({
       await emitToolCallDelta(callId, name, delta);
     };
 
-    try {
-      const reader = upstreamResp.body!.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      let finished = false;
-      while (!finished) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunkText = decoder.decode(value, { stream: true });
-        raw += chunkText;
-        buf += chunkText;
-        const lines = buf.split("\n");
-        buf = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.startsWith("data:")) continue;
-          sawDataLine = true;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") {
-            finished = true;
-            break;
-          }
-          let payload: any;
-          try {
-            payload = JSON.parse(data);
-          } catch {
-            continue;
-          }
-          collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
-          const evt = payload?.type;
+	    try {
+	      const reader = upstreamResp.body!.getReader();
+	      const decoder = new TextDecoder();
+	      const sse = new SseTextStreamParser();
+	      let finished = false;
+	      const sendFinalChunkOnce = async () => {
+	        if (sentFinal) return;
+	        const finishReason = toolCallsById.size ? "tool_calls" : "stop";
+	        const finalChunk = {
+	          id: chatId,
+	          object: "chat.completion.chunk",
+	          created,
+	          model: outModel,
+	          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+	        };
+	        await writer.write(encoder.encode(encodeSseData(JSON.stringify(finalChunk))));
+	        sentFinal = true;
+	      };
 
-          if (evt === "response.created" && payload?.response && typeof payload.response === "object") {
-            const rid = payload.response.id;
-            if (typeof rid === "string" && rid) {
-              responseId = rid;
-              chatId = `chatcmpl_${rid}`;
-            }
-            const m = payload.response.model;
-            if (typeof m === "string" && m) outModel = m;
-            const c = payload.response.created_at;
-            if (Number.isInteger(c)) created = c;
-            continue;
-          }
+	      const handleEventData = async (data: string): Promise<boolean> => {
+	        if (!data) return false;
+	        sawDataLine = true;
+	        if (data === "[DONE]") {
+	          await sendFinalChunkOnce();
+	          return true;
+	        }
 
-          if (evt === "response.function_call_arguments.delta") {
-            await upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.delta, "delta");
-            continue;
-          }
+	        let payload: any;
+	        try {
+	          payload = JSON.parse(data);
+	        } catch {
+	          return false;
+	        }
+	        collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
+	        const evt = payload?.type;
 
-          if (evt === "response.function_call_arguments.done" || evt === "response.function_call.done") {
-            await upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.arguments, "full");
-            continue;
-          }
+	        if (evt === "response.created" && payload?.response && typeof payload.response === "object") {
+	          const rid = payload.response.id;
+	          if (typeof rid === "string" && rid) {
+	            responseId = rid;
+	            chatId = `chatcmpl_${rid}`;
+	          }
+	          const m = payload.response.model;
+	          if (typeof m === "string" && m) outModel = m;
+	          const c = payload.response.created_at;
+	          if (Number.isInteger(c)) created = c;
+	          return false;
+	        }
 
-          if ((evt === "response.output_item.added" || evt === "response.output_item.done") && payload?.item && typeof payload.item === "object") {
-            const item = payload.item;
-            if (item?.type === "function_call") {
-              await upsertToolCall(item.call_id ?? item.callId ?? item.id, item.name ?? item.function?.name, item.arguments ?? item.function?.arguments, "full");
-            }
-            continue;
-          }
+	        if (evt === "response.function_call_arguments.delta") {
+	          await upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.delta, "delta");
+	          return false;
+	        }
 
-          if ((evt === "response.reasoning.delta" || evt === "response.reasoning_summary.delta") && typeof payload.delta === "string" && payload.delta) {
-            await emitReasoningDelta(payload.delta);
-            continue;
-          }
+	        if (evt === "response.function_call_arguments.done" || evt === "response.function_call.done") {
+	          await upsertToolCall(payload.call_id ?? payload.callId ?? payload.id, payload.name, payload.arguments, "full");
+	          return false;
+	        }
 
-          if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string" && payload.delta) {
-            sawDelta = true;
-            sentAnyText = true;
-            await ensureAssistantRoleSent();
-            const chunk = {
-              id: chatId,
-              object: "chat.completion.chunk",
-              created,
-              model: outModel,
-              choices: [{ index: 0, delta: { content: payload.delta }, finish_reason: null }],
-            };
-            await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
-            continue;
-          }
+	        if ((evt === "response.output_item.added" || evt === "response.output_item.done") && payload?.item && typeof payload.item === "object") {
+	          const item = payload.item;
+	          if (item?.type === "function_call") {
+	            await upsertToolCall(item.call_id ?? item.callId ?? item.id, item.name ?? item.function?.name, item.arguments ?? item.function?.arguments, "full");
+	          }
+	          return false;
+	        }
 
-          if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string" && payload.text) {
-            sentAnyText = true;
-            await ensureAssistantRoleSent();
-            const chunk = {
-              id: chatId,
-              object: "chat.completion.chunk",
-              created,
-              model: outModel,
-              choices: [{ index: 0, delta: { content: payload.text }, finish_reason: null }],
-            };
-            await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
-            continue;
-          }
+	        if ((evt === "response.reasoning.delta" || evt === "response.reasoning_summary.delta") && typeof payload.delta === "string" && payload.delta) {
+	          await emitReasoningDelta(payload.delta);
+	          return false;
+	        }
 
-          if (evt === "response.completed" || evt === "response.failed") {
-            if (evt === "response.completed" && payload?.response && typeof payload.response === "object") {
-              const rid = payload.response.id;
-              if (!responseId && typeof rid === "string" && rid) responseId = rid;
+	        if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string" && payload.delta) {
+	          sawDelta = true;
+	          sentAnyText = true;
+	          await ensureAssistantRoleSent();
+	          const chunk = {
+	            id: chatId,
+	            object: "chat.completion.chunk",
+	            created,
+	            model: outModel,
+	            choices: [{ index: 0, delta: { content: payload.delta }, finish_reason: null }],
+	          };
+	          await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+	          return false;
+	        }
 
-              const calls = extractToolCallsFromResponsesResponse(payload.response);
-              for (const c of calls) await upsertToolCall(c.call_id, c.name, c.arguments, "full");
+	        if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string" && payload.text) {
+	          sentAnyText = true;
+	          await ensureAssistantRoleSent();
+	          const chunk = {
+	            id: chatId,
+	            object: "chat.completion.chunk",
+	            created,
+	            model: outModel,
+	            choices: [{ index: 0, delta: { content: payload.text }, finish_reason: null }],
+	          };
+	          await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+	          return false;
+	        }
 
-              if (!sawDelta && !sentAnyText) {
-                const t = extractOutputTextFromResponsesResponse(payload.response);
-                if (t) {
-                  sentAnyText = true;
-                  await ensureAssistantRoleSent();
-                  const chunk = {
-                    id: chatId,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: outModel,
-                    choices: [{ index: 0, delta: { content: t }, finish_reason: null }],
-                  };
-                  await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
-                }
-              }
-            }
-            if (!sentFinal) {
-              const finishReason = toolCallsById.size ? "tool_calls" : "stop";
-              const finalChunk = {
-                id: chatId,
-                object: "chat.completion.chunk",
-                created,
-                model: outModel,
-                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-              };
-              await writer.write(encoder.encode(encodeSseData(JSON.stringify(finalChunk))));
-              sentFinal = true;
-            }
-            finished = true;
-            break;
-          }
-        }
-      }
-      try {
-        await reader.cancel();
-      } catch {}
-    } catch (err) {
+	        if (evt === "response.completed" || evt === "response.failed") {
+	          if (evt === "response.completed" && payload?.response && typeof payload.response === "object") {
+	            const rid = payload.response.id;
+	            if (!responseId && typeof rid === "string" && rid) responseId = rid;
+
+	            const calls = extractToolCallsFromResponsesResponse(payload.response);
+	            for (const c of calls) await upsertToolCall(c.call_id, c.name, c.arguments, "full");
+
+	            if (!sawDelta && !sentAnyText) {
+	              const t = extractOutputTextFromResponsesResponse(payload.response);
+	              if (t) {
+	                sentAnyText = true;
+	                await ensureAssistantRoleSent();
+	                const chunk = {
+	                  id: chatId,
+	                  object: "chat.completion.chunk",
+	                  created,
+	                  model: outModel,
+	                  choices: [{ index: 0, delta: { content: t }, finish_reason: null }],
+	                };
+	                await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+	              }
+	            }
+	          }
+
+	          await sendFinalChunkOnce();
+	          return true;
+	        }
+
+	        return false;
+	      };
+	      while (!finished) {
+	        const { done, value } = await reader.read();
+	        if (done) break;
+	        const chunkText = decoder.decode(value, { stream: true });
+	        raw += chunkText;
+	        const events = sse.push(chunkText);
+	        for (const evt0 of events) {
+	          if (await handleEventData(evt0.data)) {
+	            finished = true;
+	            break;
+	          }
+	        }
+	      }
+	      if (!finished) {
+	        for (const evt0 of sse.finish()) {
+	          if (await handleEventData(evt0.data)) {
+	            finished = true;
+	            break;
+	          }
+	        }
+	      }
+	      try {
+	        await reader.cancel();
+	      } catch {}
+	    } catch (err) {
       if (debug) {
         const message = err instanceof Error ? err.message : String(err ?? "stream error");
         logDebug(debug, reqId, "openai stream translate error", { error: message });
@@ -394,4 +412,3 @@ export function handleOpenAIChatCompletionsViaResponsesStream({
   if (debug) logDebug(debug, reqId, "request done", { elapsedMs: Date.now() - startedAt });
   return new Response(readable, { status: 200, headers: sseHeaders() });
 }
-
