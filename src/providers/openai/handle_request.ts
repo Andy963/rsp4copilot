@@ -1,4 +1,4 @@
-import { getRsp4CopilotLimits, jsonError, jsonResponse, logDebug, normalizeAuthValue, redactHeadersForLog } from "../../common";
+import { getRsp4CopilotLimits, getRsp4CopilotStreamLimits, jsonError, jsonResponse, logDebug, normalizeAuthValue, redactHeadersForLog } from "../../common";
 import { handleOpenAIChatCompletionsViaResponses } from "./handle_chat_completions";
 import { handleOpenAITextCompletionsViaResponses } from "./handle_text_completions";
 import { getPromptCachingParams, getReasoningEffort } from "./params";
@@ -57,6 +57,7 @@ export async function handleOpenAIRequest({
   if (debug) logDebug(debug, reqId, "openai upstream headers", { headers: redactHeadersForLog(headers) });
 
   const limits = getRsp4CopilotLimits(env);
+  const streamLimits = getRsp4CopilotStreamLimits(env);
   const reasoningEffort = getReasoningEffort(reqJson, env);
   const promptCache = getPromptCachingParams(reqJson);
 
@@ -69,6 +70,7 @@ export async function handleOpenAIRequest({
       model,
       stream,
       limits,
+      maxBufferedSseBytes: streamLimits.maxBufferedSseBytes,
       reasoningEffort,
       promptCache,
       debug,
@@ -87,6 +89,7 @@ export async function handleOpenAIRequest({
     stream,
     token,
     limits,
+    maxBufferedSseBytes: streamLimits.maxBufferedSseBytes,
     reasoningEffort,
     promptCache,
     debug,
@@ -96,4 +99,3 @@ export async function handleOpenAIRequest({
     extraSystemText,
   });
 }
-

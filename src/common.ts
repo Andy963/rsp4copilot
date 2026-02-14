@@ -2,10 +2,12 @@ import type { Env } from "./common/types";
 
 export type { Env } from "./common/types";
 export {
+  DEFAULT_RESP_MAX_BUFFERED_SSE_BYTES,
   DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS,
   DEFAULT_RSP4COPILOT_MAX_MESSAGES,
   DEFAULT_RSP4COPILOT_MAX_TURNS,
   getRsp4CopilotLimits,
+  getRsp4CopilotStreamLimits,
 } from "./common/limits";
 export { measureOpenAIChatMessages, trimOpenAIChatMessages } from "./common/openai_chat_messages";
 

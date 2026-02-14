@@ -23,3 +23,7 @@ RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"apiMode":"openai-respons
 # RSP4COPILOT_MAX_MESSAGES=200
 # DEFAULT_RSP4COPILOT_MAX_INPUT_CHARS=300000
 # RSP4COPILOT_MAX_INPUT_CHARS=300000
+
+# When client sets stream=false, rsp4copilot may need to buffer upstream SSE into a single JSON response.
+# This cap prevents unbounded buffering; set 0 to disable.
+# RESP_MAX_BUFFERED_SSE_BYTES=4194304
