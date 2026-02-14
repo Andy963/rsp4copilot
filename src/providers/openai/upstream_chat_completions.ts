@@ -1,4 +1,4 @@
-import { jsonError, jsonResponse, logDebug, normalizeAuthValue, redactHeadersForLog, sseHeaders } from "../../common";
+import { getRsp4CopilotStreamLimits, jsonError, jsonResponse, logDebug, normalizeAuthValue, redactHeadersForLog, sseHeaders } from "../../common";
 import { SseTextStreamParser } from "../../protocols/stream/sse";
 import { selectUpstreamResponseAny } from "./upstream_select";
 import { buildChatCompletionsUrls } from "./urls";
@@ -63,7 +63,10 @@ export async function handleOpenAIChatCompletionsUpstream({
   void path;
   void startedAt;
 
-  const sel = await selectUpstreamResponseAny(upstreamUrls, headers, [body], debug, reqId);
+  const streamLimits = getRsp4CopilotStreamLimits(env);
+  const sel = await selectUpstreamResponseAny(upstreamUrls, headers, [body], debug, reqId, {
+    emptySseDetectTimeoutMs: streamLimits.emptySseDetectTimeoutMs,
+  });
   if (!sel.ok && debug) {
     logDebug(debug, reqId, "openai chat-completions upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
   }

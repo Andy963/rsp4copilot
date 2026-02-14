@@ -1,5 +1,6 @@
 import {
   getRsp4CopilotLimits,
+  getRsp4CopilotStreamLimits,
   getSessionKey,
   jsonError,
   jsonResponse,
@@ -157,7 +158,10 @@ export async function handleOpenAIResponsesUpstream({
     });
   }
 
-  const sel = await selectUpstreamResponseAny(upstreamUrls, headers, variants, debug, reqId);
+  const streamLimits = getRsp4CopilotStreamLimits(env);
+  const sel = await selectUpstreamResponseAny(upstreamUrls, headers, variants, debug, reqId, {
+    emptySseDetectTimeoutMs: streamLimits.emptySseDetectTimeoutMs,
+  });
   if (!sel.ok && debug) {
     logDebug(debug, reqId, "openai upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
   }
@@ -308,4 +312,3 @@ export async function handleOpenAIResponsesUpstream({
 
   return jsonResponse(200, responseObj);
 }
-

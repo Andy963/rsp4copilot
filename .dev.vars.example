@@ -27,3 +27,8 @@ RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"apiMode":"openai-respons
 # When client sets stream=false, rsp4copilot may need to buffer upstream SSE into a single JSON response.
 # This cap prevents unbounded buffering; set 0 to disable.
 # RESP_MAX_BUFFERED_SSE_BYTES=4194304
+
+# Empty event-stream probe (optional)
+# Some relays respond with `200 text/event-stream` but immediately EOF (or only whitespace/comments).
+# This timeout controls how long rsp4copilot probes for a `data:` line before deciding "not empty".
+# RESP_EMPTY_SSE_DETECT_TIMEOUT_MS=150
