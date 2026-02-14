@@ -52,6 +52,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
   stream,
   token,
   limits,
+  maxBufferedSseBytes,
   reasoningEffort,
   promptCache,
   debug,
@@ -69,6 +70,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
   stream: boolean;
   token: string;
   limits: { maxTurns: number; maxMessages: number; maxInputChars: number };
+  maxBufferedSseBytes: number;
   reasoningEffort: string;
   promptCache: { prompt_cache_retention: string; safety_identifier: string };
   debug: boolean;
@@ -233,6 +235,8 @@ export async function handleOpenAIChatCompletionsViaResponses({
     let sawToolCall = false;
     let sawDataLine = false;
     let raw = "";
+    let bufferedBytes = 0;
+    const maxBytes = Number.isFinite(maxBufferedSseBytes) ? maxBufferedSseBytes : 0;
     const thoughtSigUpdates: any = {};
     const toolCallsById = new Map<string, { name: string; args: string }>(); // call_id -> { name, args }
     const upsertToolCall = (callIdRaw: any, nameRaw: any, argsRaw: any, mode: "delta" | "full") => {
@@ -257,6 +261,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
     const decoder = new TextDecoder();
     const sse = new SseTextStreamParser();
     let finished = false;
+    let overflow = false;
     const handleEventData = (data: string): boolean => {
       if (!data) return false;
       sawDataLine = true;
@@ -329,8 +334,12 @@ export async function handleOpenAIChatCompletionsViaResponses({
     while (!finished) {
       const { done, value } = await reader.read();
       if (done) break;
+      bufferedBytes += value.byteLength;
+      if (maxBytes > 0 && bufferedBytes > maxBytes) {
+        overflow = true;
+        break;
+      }
       const chunkText = decoder.decode(value, { stream: true });
-      raw += chunkText;
       const events = sse.push(chunkText);
       for (const evt0 of events) {
         if (handleEventData(evt0.data)) {
@@ -338,6 +347,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
           break;
         }
       }
+      if (!sawDataLine) raw += chunkText;
     }
     if (!finished) {
       for (const evt0 of sse.finish()) {
@@ -350,6 +360,26 @@ export async function handleOpenAIChatCompletionsViaResponses({
     try {
       await reader.cancel();
     } catch {}
+    if (overflow) {
+      if (debug) {
+        logDebug(debug, reqId, "openai upstream buffered sse overflow", {
+          maxBytes,
+          bufferedBytes,
+          sawDataLine,
+          sawDelta,
+          sawAnyText,
+          textLen: fullText.length,
+          reasoningLen: reasoningText.length,
+        });
+      }
+      return jsonResponse(
+        502,
+        jsonError(
+          `Upstream event-stream output exceeded RESP_MAX_BUFFERED_SSE_BYTES (${maxBytes}); please use stream:true to avoid buffering`,
+          "bad_gateway",
+        ),
+      );
+    }
     if (!sawDataLine && raw.trim()) {
       try {
         const obj = JSON.parse(raw);
@@ -407,6 +437,8 @@ export async function handleOpenAIChatCompletionsViaResponses({
         sawDataLine,
         sawDelta,
         sawAnyText,
+        maxBufferedSseBytes: maxBytes,
+        bufferedBytes,
         rawLen: raw.length,
       });
     }
