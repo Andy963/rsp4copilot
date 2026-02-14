@@ -1,5 +1,10 @@
 import { jsonError, logDebug, previewString, redactHeadersForLog } from "../../common";
 
+type UpstreamSelectOptions = {
+  emptySseDetectTimeoutMs?: number;
+  emptySseDetectMaxProbeBytes?: number;
+};
+
 function shouldRetryUpstream(status: any, bodyText: any = ""): boolean {
   // Only retry variants for likely "payload/shape mismatch" errors.
   // Avoid spamming many retries for path/auth errors that some relays report as 400/422.
@@ -39,20 +44,42 @@ function shouldTryNextUpstreamUrl(status: any): boolean {
   return status === 400 || status === 422 || status === 403 || status === 404 || status === 405 || status === 500 || status === 502 || status === 503;
 }
 
-async function isProbablyEmptyEventStream(resp: Response): Promise<boolean> {
+async function probeEmptyEventStream(resp: Response, opts: UpstreamSelectOptions): Promise<{
+  isEmpty: boolean;
+  reason: string;
+  elapsedMs: number;
+  timeoutMs: number;
+  bytesRead: number;
+  sawDataLine: boolean;
+}> {
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   try {
     const ct = (resp?.headers?.get("content-type") || "").toLowerCase();
-    if (!ct.includes("text/event-stream")) return false;
-    if (!resp?.body) return true;
+    if (!ct.includes("text/event-stream")) {
+      return { isEmpty: false, reason: "not_event_stream", elapsedMs: 0, timeoutMs: 0, bytesRead: 0, sawDataLine: false };
+    }
+    if (!resp?.body) {
+      return { isEmpty: true, reason: "no_body", elapsedMs: 0, timeoutMs: 0, bytesRead: 0, sawDataLine: false };
+    }
+
+    const timeoutMsRaw = typeof opts?.emptySseDetectTimeoutMs === "number" ? opts.emptySseDetectTimeoutMs : 150;
+    const timeoutMs = Number.isFinite(timeoutMsRaw) ? timeoutMsRaw : 150;
+    if (timeoutMs <= 0) {
+      return { isEmpty: false, reason: "disabled", elapsedMs: 0, timeoutMs, bytesRead: 0, sawDataLine: false };
+    }
+
+    const maxProbeBytesRaw = typeof opts?.emptySseDetectMaxProbeBytes === "number" ? opts.emptySseDetectMaxProbeBytes : 4096;
+    const maxProbeBytes = Number.isFinite(maxProbeBytesRaw) ? maxProbeBytesRaw : 4096;
 
     const clone = resp.clone();
     const reader0 = clone.body?.getReader();
-    if (!reader0) return true;
+    if (!reader0) return { isEmpty: true, reason: "no_reader", elapsedMs: 0, timeoutMs, bytesRead: 0, sawDataLine: false };
     reader = reader0;
 
-    let bytesSeen = 0;
-    const deadlineMs = 150;
+    let bytesRead = 0;
+    let sawDataLine = false;
+    const decoder = new TextDecoder();
+    let buf = "";
     const startedAt = Date.now();
 
     type ReadWithTimeoutResult = { timeout: true } | { timeout: false; done: boolean; value?: Uint8Array };
@@ -68,24 +95,47 @@ async function isProbablyEmptyEventStream(resp: Response): Promise<boolean> {
       });
     };
 
-    while (Date.now() - startedAt < deadlineMs) {
-      const remaining = Math.max(0, deadlineMs - (Date.now() - startedAt));
+    while (Date.now() - startedAt < timeoutMs && bytesRead < maxProbeBytes) {
+      const remaining = Math.max(0, timeoutMs - (Date.now() - startedAt));
       const first = await readWithTimeout(Math.min(50, remaining));
 
       // If it hasn't produced anything quickly, assume it's not empty (could just be slow model output).
-      if (first.timeout) return false;
-      if (first.done) return bytesSeen === 0;
+      if (first.timeout) {
+        return { isEmpty: false, reason: "timeout", elapsedMs: Date.now() - startedAt, timeoutMs, bytesRead, sawDataLine };
+      }
+      if (first.done) {
+        const isEmpty = bytesRead === 0 || !sawDataLine;
+        const reason = bytesRead === 0 ? "eof_zero_bytes" : sawDataLine ? "eof_with_data" : "eof_without_data";
+        return { isEmpty, reason, elapsedMs: Date.now() - startedAt, timeoutMs, bytesRead, sawDataLine };
+      }
       const value = first.value;
       if (value && typeof value.length === "number") {
-        if (value.length > 0) return false;
-        // Some runtimes can yield a zero-length chunk; treat as inconclusive and keep reading briefly.
-        bytesSeen += value.length;
+        if (value.length === 0) continue;
+        bytesRead += value.byteLength;
+        const chunkText = decoder.decode(value, { stream: true });
+        buf += chunkText;
+        if (buf.length > 8192) buf = buf.slice(-8192);
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const line0 of lines) {
+          const line = line0.endsWith("\r") ? line0.slice(0, -1) : line0;
+          if (!line.startsWith("data:")) continue;
+          sawDataLine = true;
+          return { isEmpty: false, reason: "data_line", elapsedMs: Date.now() - startedAt, timeoutMs, bytesRead, sawDataLine };
+        }
       }
     }
 
-    return false;
+    return {
+      isEmpty: false,
+      reason: bytesRead >= maxProbeBytes ? "probe_bytes_limit" : "probe_time_limit",
+      elapsedMs: Date.now() - startedAt,
+      timeoutMs,
+      bytesRead,
+      sawDataLine,
+    };
   } catch {
-    return false;
+    return { isEmpty: false, reason: "probe_error", elapsedMs: 0, timeoutMs: 0, bytesRead: 0, sawDataLine: false };
   } finally {
     try {
       await reader?.cancel();
@@ -99,6 +149,7 @@ async function selectUpstreamResponse(
   variants: any[],
   debug = false,
   reqId = "",
+  opts: UpstreamSelectOptions = {},
 ): Promise<{ ok: true; resp: Response; upstreamUrl: string } | { ok: false; status: number; error: any; upstreamUrl: string }> {
   let lastStatus = 502;
   let lastText = "";
@@ -157,7 +208,7 @@ async function selectUpstreamResponse(
       }
 
       // If it still comes back as an empty SSE, keep trying other modes.
-      if (resp2.ok && (await isProbablyEmptyEventStream(resp2))) continue;
+      if (resp2.ok && (await probeEmptyEventStream(resp2, opts)).isEmpty) continue;
 
       // Return the first non-empty response (ok or error) so the caller can handle it.
       return resp2;
@@ -199,7 +250,11 @@ async function selectUpstreamResponse(
       const message = err instanceof Error ? err.message : "fetch failed";
       return { ok: false, status: 502, error: jsonError(`Upstream fetch failed: ${message}`, "bad_gateway"), upstreamUrl };
     }
-    if (resp.ok && (await isProbablyEmptyEventStream(resp))) {
+    if (resp.ok) {
+      const probe = await probeEmptyEventStream(resp, opts);
+      if (!probe.isEmpty) {
+        // Not empty (or inconclusive): proceed normally.
+      } else {
       sawEmptyEventStream = true;
       if (debug) {
         logDebug(debug, reqId, "openai upstream empty event stream", {
@@ -208,6 +263,7 @@ async function selectUpstreamResponse(
           status: resp.status,
           contentType: resp.headers.get("content-type") || "",
           contentLength: resp.headers.get("content-length") || "",
+          probe,
         });
       }
 
@@ -222,6 +278,7 @@ async function selectUpstreamResponse(
       }
 
       resp = nonStream;
+      }
     }
     if (resp.status >= 400) {
       lastStatus = resp.status;
@@ -269,6 +326,7 @@ export async function selectUpstreamResponseAny(
   variants: any,
   debug = false,
   reqId = "",
+  opts: UpstreamSelectOptions = {},
 ): Promise<{ ok: true; resp: Response; upstreamUrl: string } | { ok: false; status: number; error: any; upstreamUrl?: string }> {
   const urls = Array.isArray(upstreamUrls) ? upstreamUrls.filter(Boolean) : [];
   if (!urls.length) {
@@ -278,7 +336,7 @@ export async function selectUpstreamResponseAny(
   let firstErr: any | null = null;
   for (const url of urls) {
     if (debug) logDebug(debug, reqId, "openai upstream try", { url });
-    const sel = await selectUpstreamResponse(url, headers, variants, debug, reqId);
+    const sel = await selectUpstreamResponse(url, headers, variants, debug, reqId, opts);
     if (debug && !sel.ok) {
       logDebug(debug, reqId, "openai upstream try failed", {
         upstreamUrl: sel.upstreamUrl,
@@ -292,4 +350,3 @@ export async function selectUpstreamResponseAny(
   }
   return firstErr || { ok: false, status: 502, error: jsonError("Upstream error", "bad_gateway") };
 }
-

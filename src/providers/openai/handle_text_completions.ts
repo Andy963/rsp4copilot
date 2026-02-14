@@ -22,6 +22,7 @@ export async function handleOpenAITextCompletionsViaResponses({
   stream,
   limits,
   maxBufferedSseBytes,
+  emptySseDetectTimeoutMs,
   reasoningEffort,
   promptCache,
   debug,
@@ -36,6 +37,7 @@ export async function handleOpenAITextCompletionsViaResponses({
   stream: boolean;
   limits: { maxInputChars: number };
   maxBufferedSseBytes: number;
+  emptySseDetectTimeoutMs: number;
   reasoningEffort: string;
   promptCache: { prompt_cache_retention: string; safety_identifier: string };
   debug: boolean;
@@ -94,7 +96,7 @@ export async function handleOpenAITextCompletionsViaResponses({
       requestPreview: previewString(reqLog, 2400),
     });
   }
-  const sel = await selectUpstreamResponseAny(upstreamUrls, headers, variants, debug, reqId);
+  const sel = await selectUpstreamResponseAny(upstreamUrls, headers, variants, debug, reqId, { emptySseDetectTimeoutMs });
   if (!sel.ok && debug) {
     logDebug(debug, reqId, "openai upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
   }
