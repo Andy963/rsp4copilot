@@ -556,7 +556,8 @@ export default {
       const stack = err instanceof Error ? err.stack : "";
       console.error(`[rsp4copilot][${reqId}] critical error: ${message}`, { stack });
       if (debug) logDebug(debug, reqId, "unhandled exception", { error: message, stack: previewString(stack, 2400) });
-      return withCors(jsonResponse(500, jsonError(`Internal Server Error: ${message}`, "server_error")), corsHeaders);
+      // 🛡️ Sentinel: Sanitize error message to prevent information leakage
+      return withCors(jsonResponse(500, jsonError("Internal Server Error", "server_error")), corsHeaders);
     }
   },
 };
