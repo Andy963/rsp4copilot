@@ -98,6 +98,42 @@ export default {
         return new Response(null, { status: 204, headers: corsHeaders });
       }
 
+      if (request.method === "GET" && path === "/") {
+        const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rsp4copilot</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:2rem auto;padding:1rem;line-height:1.5;color:#1f2937}
+h1{color:#111827;font-size:1.5rem;border-bottom:1px solid #e5e7eb;padding-bottom:0.5rem}
+code{background:#f3f4f6;padding:0.2rem 0.4rem;border-radius:4px;font-size:0.9em;font-family:monospace}
+.tag{background:#d1fae5;color:#065f46;padding:0.25rem 0.75rem;border-radius:9999px;font-size:0.875rem;font-weight:500;display:inline-block;margin-bottom:1rem}
+ul{padding-left:1.2rem}li{margin-bottom:0.5rem}
+a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
+.mute{color:#6b7280;font-size:0.875rem;margin-top:2rem;border-top:1px solid #e5e7eb;padding-top:1rem}
+</style>
+</head>
+<body>
+<h1>🎨 rsp4copilot</h1>
+<div class="tag">✅ Service is running</div>
+<p>LLM API Gateway & Router for Cloudflare Workers.</p>
+<h3>Endpoints</h3>
+<ul>
+<li><code>POST /v1/chat/completions</code></li>
+<li><code>POST /v1/responses</code></li>
+<li><code>POST /claude/v1/messages</code></li>
+<li><code>POST /gemini/v1beta/models/{model}:generateContent</code></li>
+</ul>
+<div class="mute">Authentication required for all API endpoints.</div>
+</body>
+</html>`;
+        return new Response(html, {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8", ...corsHeaders },
+        });
+      }
+
       if (debug) {
         const authHeader = request.headers.get("authorization") || "";
         const hasBearer = typeof authHeader === "string" && authHeader.toLowerCase().includes("bearer ");
