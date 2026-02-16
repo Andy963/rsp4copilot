@@ -113,61 +113,80 @@ function readGatewayConfigRaw(env: Env): string {
   return "";
 }
 
+let cachedGatewayConfig: {
+  raw: string;
+  result:
+    | { ok: true; config: GatewayConfig; source: "env"; error: "" }
+    | { ok: false; config: null; source: "none" | "env"; error: string };
+} | null = null;
+
 export function parseGatewayConfig(env: Env):
   | { ok: true; config: GatewayConfig; source: "env"; error: "" }
   | { ok: false; config: null; source: "none" | "env"; error: string } {
   const raw = readGatewayConfigRaw(env);
   if (!raw.trim()) return { ok: false, config: null, source: "none", error: "Missing RSP4COPILOT_CONFIG" };
 
-  const parsed = parseJsonc(raw);
-  if (!parsed.ok) return { ok: false, config: null, source: "env", error: `Invalid config: ${parsed.error}` };
-
-  const root = parsed.value;
-  if (!isPlainObject(root)) return { ok: false, config: null, source: "env", error: "Config must be a JSON object" };
-
-  const version = Number((root as any).version ?? 1);
-  if (!Number.isFinite(version) || version !== 1) return { ok: false, config: null, source: "env", error: "Unsupported config version" };
-
-  const providersRaw = isPlainObject((root as any).providers) ? ((root as any).providers as Record<string, unknown>) : null;
-  if (!providersRaw) return { ok: false, config: null, source: "env", error: "Missing providers" };
-
-  const providers: Record<string, ProviderConfig> = {};
-  for (const [idRaw, pr] of Object.entries(providersRaw)) {
-    const id = String(idRaw ?? "").trim();
-    if (!id) continue;
-    if (id.includes(".")) {
-      return { ok: false, config: null, source: "env", error: `Provider id must not contain '.': ${id}` };
-    }
-    const p = normalizeProviderConfig(id, pr);
-    if (!p.apiMode) return { ok: false, config: null, source: "env", error: `Provider ${id}: missing apiMode` };
-    if (!p.baseURLs.length) return { ok: false, config: null, source: "env", error: `Provider ${id}: missing baseURL` };
-    if (!p.ownedBy) p.ownedBy = inferProviderOwnedBy(p.apiMode, id);
-
-    // Normalize base URLs early.
-    p.baseURLs = p.baseURLs
-      .map((u) => normalizeBaseUrl(u))
-      .map((u) => u.trim())
-      .filter(Boolean);
-    if (!p.baseURLs.length) return { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL` };
-
-    if (!p.apiKey && !p.apiKeyEnv) {
-      return { ok: false, config: null, source: "env", error: `Provider ${id}: missing apiKey or apiKeyEnv` };
-    }
-
-    const modelMap: Record<string, ModelConfig> = {};
-    for (const [mnRaw, mr] of Object.entries(isPlainObject(p.models) ? p.models : {})) {
-      const mn = String(mnRaw ?? "").trim();
-      if (!mn) continue;
-      modelMap[mn] = normalizeModelConfig(mn, mr);
-    }
-    p.models = modelMap;
-
-    providers[id] = p;
+  if (cachedGatewayConfig && cachedGatewayConfig.raw === raw) {
+    return cachedGatewayConfig.result;
   }
 
-  if (!Object.keys(providers).length) return { ok: false, config: null, source: "env", error: "No providers configured" };
+  const compute = ():
+    | { ok: true; config: GatewayConfig; source: "env"; error: "" }
+    | { ok: false; config: null; source: "none" | "env"; error: string } => {
+    const parsed = parseJsonc(raw);
+    if (!parsed.ok) return { ok: false, config: null, source: "env", error: `Invalid config: ${parsed.error}` };
 
-  return { ok: true, config: { version: 1, providers }, source: "env", error: "" };
+    const root = parsed.value;
+    if (!isPlainObject(root)) return { ok: false, config: null, source: "env", error: "Config must be a JSON object" };
+
+    const version = Number((root as any).version ?? 1);
+    if (!Number.isFinite(version) || version !== 1) return { ok: false, config: null, source: "env", error: "Unsupported config version" };
+
+    const providersRaw = isPlainObject((root as any).providers) ? ((root as any).providers as Record<string, unknown>) : null;
+    if (!providersRaw) return { ok: false, config: null, source: "env", error: "Missing providers" };
+
+    const providers: Record<string, ProviderConfig> = {};
+    for (const [idRaw, pr] of Object.entries(providersRaw)) {
+      const id = String(idRaw ?? "").trim();
+      if (!id) continue;
+      if (id.includes(".")) {
+        return { ok: false, config: null, source: "env", error: `Provider id must not contain '.': ${id}` };
+      }
+      const p = normalizeProviderConfig(id, pr);
+      if (!p.apiMode) return { ok: false, config: null, source: "env", error: `Provider ${id}: missing apiMode` };
+      if (!p.baseURLs.length) return { ok: false, config: null, source: "env", error: `Provider ${id}: missing baseURL` };
+      if (!p.ownedBy) p.ownedBy = inferProviderOwnedBy(p.apiMode, id);
+
+      // Normalize base URLs early.
+      p.baseURLs = p.baseURLs
+        .map((u) => normalizeBaseUrl(u))
+        .map((u) => u.trim())
+        .filter(Boolean);
+      if (!p.baseURLs.length) return { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL` };
+
+      if (!p.apiKey && !p.apiKeyEnv) {
+        return { ok: false, config: null, source: "env", error: `Provider ${id}: missing apiKey or apiKeyEnv` };
+      }
+
+      const modelMap: Record<string, ModelConfig> = {};
+      for (const [mnRaw, mr] of Object.entries(isPlainObject(p.models) ? p.models : {})) {
+        const mn = String(mnRaw ?? "").trim();
+        if (!mn) continue;
+        modelMap[mn] = normalizeModelConfig(mn, mr);
+      }
+      p.models = modelMap;
+
+      providers[id] = p;
+    }
+
+    if (!Object.keys(providers).length) return { ok: false, config: null, source: "env", error: "No providers configured" };
+
+    return { ok: true, config: { version: 1, providers }, source: "env", error: "" };
+  };
+
+  const result = compute();
+  cachedGatewayConfig = { raw, result };
+  return result;
 }
 
 export function getProviderApiKey(env: Env, provider: ProviderConfig): string {
