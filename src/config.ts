@@ -113,10 +113,9 @@ function readGatewayConfigRaw(env: Env): string {
   return "";
 }
 
-export function parseGatewayConfig(env: Env):
+function parseGatewayConfigInternal(raw: string):
   | { ok: true; config: GatewayConfig; source: "env"; error: "" }
   | { ok: false; config: null; source: "none" | "env"; error: string } {
-  const raw = readGatewayConfigRaw(env);
   if (!raw.trim()) return { ok: false, config: null, source: "none", error: "Missing RSP4COPILOT_CONFIG" };
 
   const parsed = parseJsonc(raw);
@@ -168,6 +167,20 @@ export function parseGatewayConfig(env: Env):
   if (!Object.keys(providers).length) return { ok: false, config: null, source: "env", error: "No providers configured" };
 
   return { ok: true, config: { version: 1, providers }, source: "env", error: "" };
+}
+
+let cachedRawConfig: string | undefined;
+let cachedConfigResult: ReturnType<typeof parseGatewayConfigInternal> | undefined;
+
+export function parseGatewayConfig(env: Env): ReturnType<typeof parseGatewayConfigInternal> {
+  const raw = readGatewayConfigRaw(env);
+  if (cachedRawConfig === raw && cachedConfigResult) {
+    return cachedConfigResult;
+  }
+  const result = parseGatewayConfigInternal(raw);
+  cachedRawConfig = raw;
+  cachedConfigResult = result;
+  return result;
 }
 
 export function getProviderApiKey(env: Env, provider: ProviderConfig): string {
