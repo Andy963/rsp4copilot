@@ -98,6 +98,17 @@ export default {
         return new Response(null, { status: 204, headers: corsHeaders });
       }
 
+      // UX: Friendly landing page instead of a 401 error on root
+      if (request.method === "GET" && path === "/") {
+        return new Response(landingPageHtml(), {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            ...corsHeaders,
+          },
+        });
+      }
+
       if (debug) {
         const authHeader = request.headers.get("authorization") || "";
         const hasBearer = typeof authHeader === "string" && authHeader.toLowerCase().includes("bearer ");
@@ -560,3 +571,156 @@ export default {
     }
   },
 };
+
+function landingPageHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>rsp4copilot</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --text: #e2e8f0;
+      --accent: #38bdf8;
+      --card: #1e293b;
+      --border: #334155;
+      --success-bg: rgba(5, 150, 105, 0.2);
+      --success-text: #34d399;
+      --success-border: rgba(5, 150, 105, 0.4);
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.6;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 1rem;
+    }
+    .container {
+      max-width: 600px;
+      width: 100%;
+    }
+    h1 {
+      font-size: 2.5rem;
+      margin: 0 0 0.5rem;
+      background: linear-gradient(90deg, var(--accent), #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      color: transparent; /* Fallback */
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.75rem;
+      background: var(--success-bg);
+      color: var(--success-text);
+      border: 1px solid var(--success-border);
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-bottom: 2rem;
+      letter-spacing: 0.05em;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 0.75rem;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    }
+    h2 {
+      margin-top: 0;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-size: 0.75rem;
+      font-weight: 700;
+      margin-bottom: 1rem;
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    li {
+      margin-bottom: 0.75rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 0.85rem;
+      color: #cbd5e1;
+      display: flex;
+      align-items: baseline;
+    }
+    .method {
+      color: var(--accent);
+      font-weight: bold;
+      margin-right: 0.75rem;
+      min-width: 3.5ch;
+    }
+    p {
+      margin: 0;
+      color: #cbd5e1;
+      font-size: 0.95rem;
+    }
+    code {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 0.1rem 0.3rem;
+      border-radius: 0.25rem;
+      color: #fbbf24;
+      font-family: monospace;
+      font-size: 0.85em;
+    }
+    a {
+      color: var(--accent);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+    a:hover {
+      color: #818cf8;
+      text-decoration: underline;
+    }
+    .footer {
+      text-align: center;
+      color: #64748b;
+      font-size: 0.875rem;
+      margin-top: 2rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>rsp4copilot</h1>
+    <div class="badge">Operational</div>
+
+    <div class="card">
+      <h2>Endpoints</h2>
+      <ul>
+        <li><span class="method">POST</span> /v1/chat/completions</li>
+        <li><span class="method">POST</span> /v1/responses</li>
+        <li><span class="method">POST</span> /claude/v1/messages</li>
+        <li><span class="method">POST</span> /gemini/v1beta/models/...</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>Usage</h2>
+      <p>
+        This is an LLM Gateway & Router running on Cloudflare Workers.<br>
+        Please include your <code>Authorization: Bearer &lt;key&gt;</code> header in requests.
+      </p>
+    </div>
+
+    <div class="footer">
+      Powered by Cloudflare Workers
+    </div>
+  </div>
+</body>
+</html>`;
+}
