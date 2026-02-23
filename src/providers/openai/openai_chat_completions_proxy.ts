@@ -1,6 +1,6 @@
 import { getRsp4CopilotStreamLimits, jsonError, jsonResponse, logDebug, normalizeAuthValue, redactHeadersForLog, sseHeaders } from "../../common";
 import { SseTextStreamParser } from "../../protocols/stream/sse";
-import { selectUpstreamResponseAny } from "./upstream_select";
+import { selectUpstreamResponseAny } from "./upstream_policy";
 import { buildChatCompletionsUrls } from "./urls";
 
 export async function handleOpenAIChatCompletionsUpstream({

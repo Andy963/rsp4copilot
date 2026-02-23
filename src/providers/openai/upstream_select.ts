@@ -1,6 +1,6 @@
 import { jsonError, logDebug, previewString, redactHeadersForLog } from "../../common";
 
-type UpstreamSelectOptions = {
+export type UpstreamSelectOptions = {
   emptySseDetectTimeoutMs?: number;
   emptySseDetectMaxProbeBytes?: number;
   circuitBreakerFailureThreshold?: number;

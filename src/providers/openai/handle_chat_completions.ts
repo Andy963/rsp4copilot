@@ -22,7 +22,7 @@ import { chatMessagesToResponsesInput, openaiToolChoiceToResponsesToolChoice, op
 import { responsesReqVariants } from "./responses_variants";
 import { getSessionPreviousResponseId, setSessionPreviousResponseId } from "./session_cache";
 import { applyCachedThoughtSignaturesToResponsesRequest, getResponsesThoughtSignatureCache, setResponsesThoughtSignatureCache } from "./thought_signature_cache";
-import { selectUpstreamResponseAny } from "./upstream_select";
+import { selectUpstreamResponseAny } from "./upstream_policy";
 import { handleOpenAIChatCompletionsViaResponsesStream } from "./handle_chat_completions_stream";
 import { SseTextStreamParser } from "../../protocols/stream/sse";
 

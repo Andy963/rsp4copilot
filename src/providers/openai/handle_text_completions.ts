@@ -11,7 +11,7 @@ import {
 import { SseTextStreamParser } from "../../protocols/stream/sse";
 import { extractFromResponsesSseText, extractOutputTextFromResponsesResponse } from "./responses_extract";
 import { responsesReqVariants } from "./responses_variants";
-import { selectUpstreamResponseAny } from "./upstream_select";
+import { selectUpstreamResponseAny } from "./upstream_policy";
 import { trimOpenAIResponsesRequestToMaxChars } from "./trim";
 
 export async function handleOpenAITextCompletionsViaResponses({
