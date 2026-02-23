@@ -144,10 +144,18 @@ export function parseGatewayConfig(env: Env):
     if (!p.ownedBy) p.ownedBy = inferProviderOwnedBy(p.apiMode, id);
 
     // Normalize base URLs early.
-    p.baseURLs = p.baseURLs
-      .map((u) => normalizeBaseUrl(u))
-      .map((u) => u.trim())
-      .filter(Boolean);
+    const normalizedBaseUrls: string[] = [];
+    for (const u0 of p.baseURLs) {
+      const u = normalizeBaseUrl(u0).trim();
+      if (!u) continue;
+      try {
+        new URL(u);
+      } catch {
+        return { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL: ${u0}` };
+      }
+      normalizedBaseUrls.push(u);
+    }
+    p.baseURLs = normalizedBaseUrls;
     if (!p.baseURLs.length) return { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL` };
 
     if (!p.apiKey && !p.apiKeyEnv) {
@@ -161,6 +169,9 @@ export function parseGatewayConfig(env: Env):
       modelMap[mn] = normalizeModelConfig(mn, mr);
     }
     p.models = modelMap;
+    if (!Object.keys(p.models).length) {
+      return { ok: false, config: null, source: "env", error: `Provider ${id}: no models configured` };
+    }
 
     providers[id] = p;
   }

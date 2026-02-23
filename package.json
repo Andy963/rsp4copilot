@@ -8,7 +8,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --keep-vars",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "rm -rf dist/test && tsc -p tsconfig.test.json && printf '{\"type\":\"commonjs\"}\\n' > dist/test/package.json && node --test test/**/*.test.cjs"
+    "test": "rm -rf dist/test && tsc -p tsconfig.test.json && printf '{\"type\":\"commonjs\"}\\n' > dist/test/package.json && node --test test/*.test.cjs test/**/*.test.cjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20251228.0",

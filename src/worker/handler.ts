@@ -36,6 +36,40 @@ function extractInboundToken(request: Request, path: string, url: URL): string {
   return normalizeAuthValue(token);
 }
 
+function normalizePathForPrefixMatch(pathname: string): string {
+  const p = String(pathname || "").trim();
+  return p.replace(/\/+$/, "") || "/";
+}
+
+function isPathPrefix(prefix: string, path: string): boolean {
+  const pfx = normalizePathForPrefixMatch(prefix);
+  const full = normalizePathForPrefixMatch(path);
+  if (pfx === "/") return true;
+  return full === pfx || full.startsWith(`${pfx}/`);
+}
+
+function findSelfForwardingProviders(gatewayCfg: { providers: Record<string, { baseURLs: string[] }> }, currentUrl: URL): Array<{ providerId: string; baseURL: string }> {
+  const out: Array<{ providerId: string; baseURL: string }> = [];
+  const currentOrigin = currentUrl.origin;
+  const currentPath = normalizePathForPrefixMatch(currentUrl.pathname);
+
+  for (const [providerId, provider] of Object.entries(gatewayCfg.providers || {})) {
+    const baseUrls = Array.isArray(provider?.baseURLs) ? provider.baseURLs : [];
+    for (const baseURL of baseUrls) {
+      try {
+        const u = new URL(baseURL);
+        if (u.origin !== currentOrigin) continue;
+        if (!isPathPrefix(u.pathname || "/", currentPath)) continue;
+        out.push({ providerId, baseURL });
+      } catch {
+        // ignore invalid URLs here; config parsing should have validated already
+      }
+    }
+  }
+
+  return out;
+}
+
 export async function handleWorkerFetch(request: Request, env: Env): Promise<Response> {
   const reqId = generateReqId();
   const debug = isDebugEnabled(env);
@@ -106,6 +140,19 @@ async function handleWorkerRequestNoCors({
     }
 
     const gatewayCfg = parseGatewayConfig(env);
+    if (gatewayCfg.ok && gatewayCfg.config) {
+      const loops = findSelfForwardingProviders(gatewayCfg.config, url);
+      if (loops.length) {
+        if (debug) logDebug(debug, reqId, "config loop guard triggered", loops[0]);
+        return jsonResponse(
+          500,
+          jsonError(
+            `Server misconfigured: provider ${loops[0].providerId} baseURL points to this worker (${loops[0].baseURL}); refusing to avoid an infinite routing loop`,
+            "server_error",
+          ),
+        );
+      }
+    }
 
     if (request.method === "GET") {
       const health = handleHealthRoute(path);
