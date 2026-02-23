@@ -3,7 +3,69 @@ import { jsonError, logDebug, previewString, redactHeadersForLog } from "../../c
 type UpstreamSelectOptions = {
   emptySseDetectTimeoutMs?: number;
   emptySseDetectMaxProbeBytes?: number;
+  circuitBreakerFailureThreshold?: number;
+  circuitBreakerCooldownMs?: number;
+  circuitBreakerMaxCooldownMs?: number;
 };
+
+type CircuitState = {
+  failures: number;
+  openUntil: number;
+  lastFailureAt: number;
+  lastStatus: number;
+};
+
+const upstreamCircuitBreaker = new Map<string, CircuitState>();
+
+function getCircuitBreakerConfig(opts: UpstreamSelectOptions): { threshold: number; cooldownMs: number; maxCooldownMs: number } {
+  const thresholdRaw = typeof opts?.circuitBreakerFailureThreshold === "number" ? opts.circuitBreakerFailureThreshold : 3;
+  const cooldownMsRaw = typeof opts?.circuitBreakerCooldownMs === "number" ? opts.circuitBreakerCooldownMs : 30_000;
+  const maxCooldownMsRaw = typeof opts?.circuitBreakerMaxCooldownMs === "number" ? opts.circuitBreakerMaxCooldownMs : 5 * 60_000;
+
+  const threshold = Number.isFinite(thresholdRaw) ? Math.max(1, Math.floor(thresholdRaw)) : 3;
+  const cooldownMs = Number.isFinite(cooldownMsRaw) ? Math.max(0, Math.floor(cooldownMsRaw)) : 30_000;
+  const maxCooldownMs = Number.isFinite(maxCooldownMsRaw) ? Math.max(cooldownMs, Math.floor(maxCooldownMsRaw)) : 5 * 60_000;
+
+  return { threshold, cooldownMs, maxCooldownMs };
+}
+
+function shouldCountAsCircuitBreakerFailure(status: number): boolean {
+  if (status === 429) return true;
+  if (status >= 500) return true;
+  if (status === 502) return true; // network/DNS errors are often mapped to 502 in this layer
+  return false;
+}
+
+function computeCircuitBreakerCooldownMs(opts: UpstreamSelectOptions, failures: number): number {
+  const cfg = getCircuitBreakerConfig(opts);
+  if (failures < cfg.threshold) return 0;
+  const exponent = Math.max(0, failures - cfg.threshold);
+  const backoff = cfg.cooldownMs * Math.pow(2, exponent);
+  return Math.min(cfg.maxCooldownMs, Math.max(cfg.cooldownMs, Math.floor(backoff)));
+}
+
+function getCircuitState(upstreamUrl: string): CircuitState {
+  return upstreamCircuitBreaker.get(upstreamUrl) || { failures: 0, openUntil: 0, lastFailureAt: 0, lastStatus: 0 };
+}
+
+function recordCircuitBreakerSuccess(upstreamUrl: string): void {
+  upstreamCircuitBreaker.set(upstreamUrl, { failures: 0, openUntil: 0, lastFailureAt: Date.now(), lastStatus: 200 });
+}
+
+function recordCircuitBreakerFailure(upstreamUrl: string, status: number, opts: UpstreamSelectOptions): CircuitState {
+  const prev = getCircuitState(upstreamUrl);
+  const failures = prev.failures + 1;
+  const cooldownMs = computeCircuitBreakerCooldownMs(opts, failures);
+  const now = Date.now();
+  const next: CircuitState = {
+    failures,
+    openUntil: cooldownMs > 0 ? now + cooldownMs : 0,
+    lastFailureAt: now,
+    lastStatus: status,
+  };
+  upstreamCircuitBreaker.set(upstreamUrl, next);
+  return next;
+}
 
 function shouldRetryUpstream(status: any, bodyText: any = ""): boolean {
   // Only retry variants for likely "payload/shape mismatch" errors.
@@ -333,9 +395,28 @@ export async function selectUpstreamResponseAny(
     return { ok: false, status: 500, error: jsonError("Server misconfigured: empty upstream URL list", "server_error") };
   }
 
+  const now = Date.now();
+  const skipped: Array<{ url: string; state: CircuitState }> = [];
+  let attempted = 0;
+
   let firstErr: any | null = null;
   for (const url of urls) {
+    const state0 = getCircuitState(url);
+    if (state0.openUntil > now) {
+      skipped.push({ url, state: state0 });
+      if (debug) {
+        logDebug(debug, reqId, "openai upstream circuit open (skip)", {
+          url,
+          failures: state0.failures,
+          openForMs: state0.openUntil - now,
+          lastStatus: state0.lastStatus,
+        });
+      }
+      continue;
+    }
+
     if (debug) logDebug(debug, reqId, "openai upstream try", { url });
+    attempted++;
     const sel = await selectUpstreamResponse(url, headers, variants, debug, reqId, opts);
     if (debug && !sel.ok) {
       logDebug(debug, reqId, "openai upstream try failed", {
@@ -344,9 +425,39 @@ export async function selectUpstreamResponseAny(
         error: sel.error,
       });
     }
-    if (sel.ok) return sel;
+    if (sel.ok) {
+      recordCircuitBreakerSuccess(url);
+      return sel;
+    }
+
+    if (shouldCountAsCircuitBreakerFailure(sel.status)) {
+      const state = recordCircuitBreakerFailure(url, sel.status, opts);
+      if (debug && state.openUntil > now) {
+        logDebug(debug, reqId, "openai upstream circuit opened", {
+          url,
+          failures: state.failures,
+          cooldownMs: Math.max(0, state.openUntil - Date.now()),
+          lastStatus: state.lastStatus,
+        });
+      }
+    }
+
     if (!firstErr) firstErr = sel;
     if (!shouldTryNextUpstreamUrl(sel.status)) return sel;
   }
+
+  // All upstreams were skipped due to an open circuit breaker. Probe the first one to recover faster.
+  if (!firstErr && attempted === 0 && skipped.length) {
+    const probe = skipped.reduce((best, cur) => (cur.state.openUntil < best.state.openUntil ? cur : best), skipped[0]);
+    if (debug) logDebug(debug, reqId, "openai upstream circuit probe", { url: probe.url, openUntil: probe.state.openUntil, failures: probe.state.failures });
+    const sel = await selectUpstreamResponse(probe.url, headers, variants, debug, reqId, opts);
+    if (sel.ok) {
+      recordCircuitBreakerSuccess(probe.url);
+      return sel;
+    }
+    if (shouldCountAsCircuitBreakerFailure(sel.status)) recordCircuitBreakerFailure(probe.url, sel.status, opts);
+    return sel;
+  }
+
   return firstErr || { ok: false, status: 502, error: jsonError("Upstream error", "bad_gateway") };
 }
