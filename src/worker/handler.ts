@@ -184,6 +184,6 @@ async function handleWorkerRequestNoCors({
     const stack = err instanceof Error ? err.stack : "";
     console.error(`[rsp4copilot][${reqId}] critical error: ${message}`, { stack });
     if (debug) logDebug(debug, reqId, "unhandled exception", { error: message, stack: previewString(stack, 2400) });
-    return jsonResponse(500, jsonError(`Internal Server Error: ${message}`, "server_error"));
+    return jsonResponse(500, jsonError("Internal Server Error", "server_error"), { "x-rsp4copilot-request-id": reqId });
   }
 }
