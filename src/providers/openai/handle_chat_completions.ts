@@ -78,6 +78,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
   token,
   limits,
   maxBufferedSseBytes,
+  emptySseDetectTimeoutMs,
   reasoningEffort,
   promptCache,
   debug,
@@ -96,6 +97,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
   token: string;
   limits: { maxTurns: number; maxMessages: number; maxInputChars: number };
   maxBufferedSseBytes: number;
+  emptySseDetectTimeoutMs: number;
   reasoningEffort: string;
   promptCache: { prompt_cache_retention: string; safety_identifier: string };
   debug: boolean;
@@ -218,13 +220,14 @@ export async function handleOpenAIChatCompletionsViaResponses({
       requestPreview: previewString(reqLog, 2400),
     });
   }
-  let sel = await selectUpstreamResponseAny(upstreamUrls, headers, primaryVariants, debug, reqId);
+  const upstreamSelectOpts = { emptySseDetectTimeoutMs };
+  let sel = await selectUpstreamResponseAny(upstreamUrls, headers, primaryVariants, debug, reqId, upstreamSelectOpts);
 
   // If the upstream doesn't accept `previous_response_id`, fall back to full history.
   if (!sel.ok && prevReq) {
     if (debug) logDebug(debug, reqId, "openai fallback to full history (previous_response_id rejected)", { status: sel.status });
     const fallbackVariants = responsesReqVariants(fullReq, upstreamStream);
-    const sel2 = await selectUpstreamResponseAny(upstreamUrls, headers, fallbackVariants, debug, reqId);
+    const sel2 = await selectUpstreamResponseAny(upstreamUrls, headers, fallbackVariants, debug, reqId, upstreamSelectOpts);
     // Always prefer the fallback result (even if it also failed), since the original error
     // about `previous_response_id` is misleading when the real issue is upstream compatibility.
     sel = sel2;
