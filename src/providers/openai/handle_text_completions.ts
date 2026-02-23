@@ -22,6 +22,7 @@ export async function handleOpenAITextCompletionsViaResponses({
   model,
   stream,
   limits,
+  maxBufferedSseBytes,
   reasoningEffort,
   promptCache,
   debug,
@@ -35,6 +36,7 @@ export async function handleOpenAITextCompletionsViaResponses({
   model: string;
   stream: boolean;
   limits: { maxInputChars: number };
+  maxBufferedSseBytes: number;
   reasoningEffort: string;
   promptCache: { prompt_cache_retention: string; safety_identifier: string };
   debug: boolean;
@@ -151,13 +153,21 @@ export async function handleOpenAITextCompletionsViaResponses({
       return false;
     };
 
+    let bufferedBytes = 0;
+    const maxBytes = Number.isFinite(maxBufferedSseBytes) ? maxBufferedSseBytes : 0;
     const reader = sel.resp.body!.getReader();
     const decoder = new TextDecoder();
     let finished = false;
+    let overflow = false;
     try {
       while (!finished) {
         const { done, value } = await reader.read();
         if (done) break;
+        bufferedBytes += value.byteLength;
+        if (maxBytes > 0 && bufferedBytes > maxBytes) {
+          overflow = true;
+          break;
+        }
         const chunkText = decoder.decode(value, { stream: true });
         raw += chunkText;
         const events = sse.push(chunkText);
@@ -180,6 +190,16 @@ export async function handleOpenAITextCompletionsViaResponses({
       try {
         await reader.cancel();
       } catch {}
+    }
+    if (overflow) {
+      if (debug) logDebug(debug, reqId, "openai upstream buffered sse overflow", { maxBytes, bufferedBytes, sawDataLine, sawDelta, sawAnyText });
+      return jsonResponse(
+        502,
+        jsonError(
+          `Upstream event-stream output exceeded RESP_MAX_BUFFERED_SSE_BYTES (${maxBytes}); please use stream:true to avoid buffering`,
+          "bad_gateway",
+        ),
+      );
     }
     if (!sawDataLine && raw.trim()) {
       try {
