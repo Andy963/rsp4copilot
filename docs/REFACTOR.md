@@ -105,6 +105,8 @@
 - `src/models_list.ts`：把 `modelIdForList()` 的 O(n²) 计数改为预计算 `Map`（O(n)）。
 - 统一 `src/providers/openai/handle_chat_completions_stream.ts` 的缩进（清理 tab），避免后续 diff 噪音。
 - 修正 `src/providers/claude/handler.ts` 中 tool args delta 分支的缩进，提升可读性。
+- `src/providers/openai/handle_chat_completions.ts`：抽取 `applyCommonResponsesRequestFields()`，去重 Responses request 的公共字段拼装（full/prev 两条路径保持一致），并把 tools/tool_choice 的转换收敛为一次计算。
+- `src/providers/openai/handle_text_completions.ts`：用 `SseTextStreamParser` 统一 stream/non-stream 的 SSE 解析路径，减少重复逻辑并提升对多行 `data:` 的兼容性。
 
 ## 后续重构点（TODO）
 

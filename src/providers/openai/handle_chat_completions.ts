@@ -26,6 +26,31 @@ import { selectUpstreamResponseAny } from "./upstream_select";
 import { handleOpenAIChatCompletionsViaResponsesStream } from "./handle_chat_completions_stream";
 import { SseTextStreamParser } from "../../protocols/stream/sse";
 
+type PromptCacheParams = { prompt_cache_retention: string; safety_identifier: string };
+
+function applyCommonResponsesRequestFields(
+  reqJson: any,
+  out: any,
+  opts: {
+    reasoningEffort: string;
+    promptCache: PromptCacheParams;
+    instructions: string;
+    maxTokens: number | null;
+    tools: any[];
+    toolChoice: any;
+  },
+): void {
+  if (opts.reasoningEffort) out.reasoning = { effort: opts.reasoningEffort };
+  if (opts.promptCache.prompt_cache_retention) out.prompt_cache_retention = opts.promptCache.prompt_cache_retention;
+  if (opts.promptCache.safety_identifier) out.safety_identifier = opts.promptCache.safety_identifier;
+  if (opts.instructions) out.instructions = opts.instructions;
+  applyTemperatureTopPFromRequest(reqJson, out);
+  if ("stop" in reqJson) out.stop = reqJson.stop;
+  if (Array.isArray(opts.tools) && opts.tools.length) out.tools = opts.tools;
+  if (opts.toolChoice !== undefined) out.tool_choice = opts.toolChoice;
+  if (Number.isInteger(opts.maxTokens)) out.max_output_tokens = opts.maxTokens;
+}
+
 function hasAssistantMessage(messages: any): boolean {
   for (const m of Array.isArray(messages) ? messages : []) {
     if (m && typeof m === "object" && (m as any).role === "assistant") return true;
@@ -77,8 +102,6 @@ export async function handleOpenAIChatCompletionsViaResponses({
   startedAt: number;
   extraSystemText: string;
 }): Promise<Response> {
-  void upstreamStream;
-
   // /v1/chat/completions
   const messages = reqJson?.messages;
   if (!Array.isArray(messages)) return jsonResponse(400, jsonError("Missing required field: messages"));
@@ -118,29 +141,26 @@ export async function handleOpenAIChatCompletionsViaResponses({
   if (!input.length) return jsonResponse(400, jsonError("messages must include at least one non-system message"));
 
   const effectiveInstructions = appendInstructions(instructions, extraSystemText);
+  const respTools = openaiToolsToResponsesTools(reqJson.tools);
+  const respToolChoice = openaiToolChoiceToResponsesToolChoice(reqJson.tool_choice);
 
   const fullReq: any = {
     model,
     input,
   };
-  if (reasoningEffort) fullReq.reasoning = { effort: reasoningEffort };
-  if (promptCache.prompt_cache_retention) fullReq.prompt_cache_retention = promptCache.prompt_cache_retention;
-  if (promptCache.safety_identifier) fullReq.safety_identifier = promptCache.safety_identifier;
-  if (effectiveInstructions) fullReq.instructions = effectiveInstructions;
-  applyTemperatureTopPFromRequest(reqJson, fullReq);
-  if ("stop" in reqJson) fullReq.stop = reqJson.stop;
-
-  const respTools = openaiToolsToResponsesTools(reqJson.tools);
-  if (respTools.length) fullReq.tools = respTools;
-  const respToolChoice = openaiToolChoiceToResponsesToolChoice(reqJson.tool_choice);
-  if (respToolChoice !== undefined) fullReq.tool_choice = respToolChoice;
-
   const maxTokens = Number.isInteger(reqJson.max_tokens)
     ? reqJson.max_tokens
     : Number.isInteger(reqJson.max_completion_tokens)
       ? reqJson.max_completion_tokens
       : null;
-  if (Number.isInteger(maxTokens)) fullReq.max_output_tokens = maxTokens;
+  applyCommonResponsesRequestFields(reqJson, fullReq, {
+    reasoningEffort,
+    promptCache,
+    instructions: effectiveInstructions,
+    maxTokens,
+    tools: respTools,
+    toolChoice: respToolChoice,
+  });
 
   const lastAssistantIdx = indexOfLastAssistantMessage(messagesForUpstream);
   const multiTurn = withinLimits && lastAssistantIdx >= 0;
@@ -157,18 +177,14 @@ export async function handleOpenAIChatCompletionsViaResponses({
         }
       : null;
   if (prevReq) {
-    if (reasoningEffort) prevReq.reasoning = { effort: reasoningEffort };
-    if (promptCache.prompt_cache_retention) prevReq.prompt_cache_retention = promptCache.prompt_cache_retention;
-    if (promptCache.safety_identifier) prevReq.safety_identifier = promptCache.safety_identifier;
-    if (effectiveInstructions) prevReq.instructions = effectiveInstructions;
-    applyTemperatureTopPFromRequest(reqJson, prevReq);
-    if ("stop" in reqJson) prevReq.stop = reqJson.stop;
-
-    const respTools = openaiToolsToResponsesTools(reqJson.tools);
-    if (respTools.length) prevReq.tools = respTools;
-    const respToolChoice = openaiToolChoiceToResponsesToolChoice(reqJson.tool_choice);
-    if (respToolChoice !== undefined) prevReq.tool_choice = respToolChoice;
-    if (Number.isInteger(maxTokens)) prevReq.max_output_tokens = maxTokens;
+    applyCommonResponsesRequestFields(reqJson, prevReq, {
+      reasoningEffort,
+      promptCache,
+      instructions: effectiveInstructions,
+      maxTokens,
+      tools: respTools,
+      toolChoice: respToolChoice,
+    });
   }
 
   const patchedFull = applyCachedThoughtSignaturesToResponsesRequest(fullReq, thoughtSigCache);

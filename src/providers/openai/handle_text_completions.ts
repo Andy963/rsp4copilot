@@ -8,6 +8,7 @@ import {
   safeJsonStringifyForLog,
   sseHeaders,
 } from "../../common";
+import { SseTextStreamParser } from "../../protocols/stream/sse";
 import { extractFromResponsesSseText, extractOutputTextFromResponsesResponse } from "./responses_extract";
 import { responsesReqVariants } from "./responses_variants";
 import { selectUpstreamResponseAny } from "./upstream_select";
@@ -112,62 +113,74 @@ export async function handleOpenAITextCompletionsViaResponses({
     let sawAnyText = false;
     let sawDataLine = false;
     let raw = "";
+    const sse = new SseTextStreamParser();
+    const handleEventData = (data: string): boolean => {
+      if (!data) return false;
+      sawDataLine = true;
+      if (data === "[DONE]") return true;
+
+      let payload: any;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        return false;
+      }
+      const evt = payload?.type;
+      if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string") {
+        sawDelta = true;
+        sawAnyText = true;
+        fullText += payload.delta;
+        return false;
+      }
+      if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string") {
+        sawAnyText = true;
+        fullText += payload.text;
+        return false;
+      }
+      if (!sawDelta && !sawAnyText && evt === "response.completed" && payload?.response && typeof payload.response === "object") {
+        const t = extractOutputTextFromResponsesResponse(payload.response);
+        if (t) {
+          sawAnyText = true;
+          fullText += t;
+        }
+        return true;
+      }
+      if (evt === "response.completed" || evt === "response.failed") {
+        return true;
+      }
+      return false;
+    };
+
     const reader = sel.resp.body!.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
     let finished = false;
-    while (!finished) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunkText = decoder.decode(value, { stream: true });
-      raw += chunkText;
-      buf += chunkText;
-      const lines = buf.split("\n");
-      buf = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        sawDataLine = true;
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") {
-          finished = true;
-          break;
-        }
-        let payload: any;
-        try {
-          payload = JSON.parse(data);
-        } catch {
-          continue;
-        }
-        const evt = payload?.type;
-        if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string") {
-          sawDelta = true;
-          sawAnyText = true;
-          fullText += payload.delta;
-          continue;
-        }
-        if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string") {
-          sawAnyText = true;
-          fullText += payload.text;
-          continue;
-        }
-        if (!sawDelta && !sawAnyText && evt === "response.completed" && payload?.response && typeof payload.response === "object") {
-          const t = extractOutputTextFromResponsesResponse(payload.response);
-          if (t) {
-            sawAnyText = true;
-            fullText += t;
+    try {
+      while (!finished) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunkText = decoder.decode(value, { stream: true });
+        raw += chunkText;
+        const events = sse.push(chunkText);
+        for (const evt0 of events) {
+          if (handleEventData(evt0.data)) {
+            finished = true;
+            break;
           }
-          finished = true;
-          break;
-        }
-        if (evt === "response.completed" || evt === "response.failed") {
-          finished = true;
-          break;
         }
       }
+      if (!finished) {
+        for (const evt0 of sse.finish()) {
+          if (handleEventData(evt0.data)) {
+            finished = true;
+            break;
+          }
+        }
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {}
     }
-    try {
-      await reader.cancel();
-    } catch {}
     if (!sawDataLine && raw.trim()) {
       try {
         const obj = JSON.parse(raw);
@@ -222,76 +235,83 @@ export async function handleOpenAITextCompletionsViaResponses({
     try {
       const reader = sel.resp.body!.getReader();
       const decoder = new TextDecoder();
-      let buf = "";
+      const sse = new SseTextStreamParser();
       let finished = false;
+      const handleEventData = async (data: string): Promise<boolean> => {
+        if (!data) return false;
+        sawDataLine = true;
+        if (data === "[DONE]") {
+          finished = true;
+          return true;
+        }
+
+        let payload: any;
+        try {
+          payload = JSON.parse(data);
+        } catch {
+          return false;
+        }
+        const evt = payload?.type;
+        if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string" && payload.delta) {
+          sawDelta = true;
+          sentAnyText = true;
+          const chunk = {
+            id: completionId,
+            object: "text_completion",
+            created,
+            model,
+            choices: [{ text: payload.delta, index: 0, logprobs: null, finish_reason: null }],
+          };
+          await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+          return false;
+        }
+        if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string" && payload.text) {
+          sentAnyText = true;
+          const chunk = {
+            id: completionId,
+            object: "text_completion",
+            created,
+            model,
+            choices: [{ text: payload.text, index: 0, logprobs: null, finish_reason: null }],
+          };
+          await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+          return false;
+        }
+        if (!sawDelta && !sentAnyText && evt === "response.completed" && payload?.response && typeof payload.response === "object") {
+          const t = extractOutputTextFromResponsesResponse(payload.response);
+          if (t) {
+            sentAnyText = true;
+            const chunk = {
+              id: completionId,
+              object: "text_completion",
+              created,
+              model,
+              choices: [{ text: t, index: 0, logprobs: null, finish_reason: null }],
+            };
+            await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+          }
+          finished = true;
+          return true;
+        }
+        if (evt === "response.completed" || evt === "response.failed") {
+          finished = true;
+          return true;
+        }
+        return false;
+      };
       while (!finished) {
         const { done, value } = await reader.read();
         if (done) break;
         const chunkText = decoder.decode(value, { stream: true });
         raw += chunkText;
-        buf += chunkText;
-        const lines = buf.split("\n");
-        buf = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.startsWith("data:")) continue;
-          sawDataLine = true;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") {
-            finished = true;
-            break;
-          }
-          let payload: any;
-          try {
-            payload = JSON.parse(data);
-          } catch {
-            continue;
-          }
-          const evt = payload?.type;
-          if ((evt === "response.output_text.delta" || evt === "response.refusal.delta") && typeof payload.delta === "string" && payload.delta) {
-            sawDelta = true;
-            sentAnyText = true;
-            const chunk = {
-              id: completionId,
-              object: "text_completion",
-              created,
-              model,
-              choices: [{ text: payload.delta, index: 0, logprobs: null, finish_reason: null }],
-            };
-            await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
-            continue;
-          }
-          if (!sawDelta && (evt === "response.output_text.done" || evt === "response.refusal.done") && typeof payload.text === "string" && payload.text) {
-            sentAnyText = true;
-            const chunk = {
-              id: completionId,
-              object: "text_completion",
-              created,
-              model,
-              choices: [{ text: payload.text, index: 0, logprobs: null, finish_reason: null }],
-            };
-            await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
-            continue;
-          }
-          if (!sawDelta && !sentAnyText && evt === "response.completed" && payload?.response && typeof payload.response === "object") {
-            const t = extractOutputTextFromResponsesResponse(payload.response);
-            if (t) {
-              sentAnyText = true;
-              const chunk = {
-                id: completionId,
-                object: "text_completion",
-                created,
-                model,
-                choices: [{ text: t, index: 0, logprobs: null, finish_reason: null }],
-              };
-              await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
-            }
-            finished = true;
-            break;
-          }
-          if (evt === "response.completed" || evt === "response.failed") {
-            finished = true;
-            break;
-          }
+        const events = sse.push(chunkText);
+        for (const evt0 of events) {
+          if (await handleEventData(evt0.data)) break;
+        }
+      }
+      if (!finished) {
+        for (const evt0 of sse.finish()) {
+          if (await handleEventData(evt0.data)) break;
         }
       }
       try {
@@ -371,4 +391,3 @@ export async function handleOpenAITextCompletionsViaResponses({
 
   return new Response(readable, { status: 200, headers: sseHeaders() });
 }
-
