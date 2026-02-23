@@ -1,13 +1,36 @@
 import type { Env } from "../../common";
-import { jsonError, jsonResponse, joinUrls, logDebug, previewString, safeJsonStringifyForLog, sseHeaders } from "../../common";
+import { jsonError, jsonResponse, joinUrls, logDebug, previewString, readFirstStringField, safeJsonStringifyForLog, sseHeaders } from "../../common";
 import { getProviderApiKey } from "../../config";
 import { dispatchOpenAIChatToProvider } from "../../dispatch";
 import { resolveModel } from "../../model_resolver";
 import { handleOpenAIRequest, handleOpenAIResponsesUpstream } from "../../providers/openai";
 import { openAIChatResponseToResponses, responsesRequestToOpenAIChat } from "../../protocols/responses";
 import { openAIChatSseToResponsesSse } from "../../protocols/stream";
-import { copilotToolUseInstructionsText, readJsonBody, shouldInjectCopilotToolUseInstructions } from "../utils";
+import { copilotToolUseInstructionsText, getProviderHintFromBody, readJsonBody, shouldInjectCopilotToolUseInstructions } from "../utils";
 import type { RouteArgs } from "../types";
+
+function buildOpenAIResponsesUpstreamEnv({
+  env,
+  baseURLs,
+  apiKey,
+  endpoints,
+  reasoningEffort,
+}: {
+  env: Env;
+  baseURLs: string[];
+  apiKey: string;
+  endpoints: Record<string, unknown>;
+  reasoningEffort: string;
+}): Env {
+  const responsesPath = readFirstStringField(endpoints, "responsesPath", "responses_path");
+  return {
+    ...env,
+    OPENAI_BASE_URL: joinUrls(baseURLs),
+    OPENAI_API_KEY: apiKey,
+    ...(responsesPath ? { RESP_RESPONSES_PATH: responsesPath } : null),
+    ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
+  };
+}
 
 export async function handleOpenAIChatCompletionsRoute({ request, env, gatewayCfg, token, debug, reqId, path, startedAt }: RouteArgs): Promise<Response> {
   const parsed = await readJsonBody(request);
@@ -23,7 +46,7 @@ export async function handleOpenAIChatCompletionsRoute({ request, env, gatewayCf
   const extraSystemText = shouldInjectCopilotToolUseInstructions(request, reqJson) ? copilotToolUseInstructionsText() : "";
 
   if (gatewayCfg.ok && gatewayCfg.config) {
-    const providerHint = reqJson.provider ?? reqJson.owned_by ?? reqJson.ownedBy ?? reqJson.owner ?? reqJson.vendor;
+    const providerHint = getProviderHintFromBody(reqJson);
     const resolved = resolveModel(gatewayCfg.config, model, providerHint);
     if (resolved.ok === false) return jsonResponse(resolved.status, resolved.error);
 
@@ -61,7 +84,7 @@ export async function handleOpenAITextCompletionsRoute({ request, env, gatewayCf
   const model = reqJson.model;
   if (typeof model !== "string" || !model.trim()) return jsonResponse(400, jsonError("Missing required field: model"));
 
-  const providerHint = reqJson.provider ?? reqJson.owned_by ?? reqJson.ownedBy ?? reqJson.owner ?? reqJson.vendor;
+  const providerHint = getProviderHintFromBody(reqJson);
   const resolved = resolveModel(gatewayCfg.config, model, providerHint);
   if (resolved.ok === false) return jsonResponse(resolved.status, resolved.error);
 
@@ -75,25 +98,16 @@ export async function handleOpenAITextCompletionsRoute({ request, env, gatewayCf
     return jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${resolved.provider.id}`, "server_error"));
   }
 
-  const responsesPath =
-    (resolved.provider.endpoints &&
-      typeof (resolved.provider.endpoints as any).responsesPath === "string" &&
-      String((resolved.provider.endpoints as any).responsesPath).trim()) ||
-    (resolved.provider.endpoints &&
-      typeof (resolved.provider.endpoints as any).responses_path === "string" &&
-      String((resolved.provider.endpoints as any).responses_path).trim()) ||
-    "";
-
   const modelOpts = resolved.model?.options || {};
   const reasoningEffort = typeof (modelOpts as any).reasoningEffort === "string" ? String((modelOpts as any).reasoningEffort).trim() : "";
 
-  const env2: Env = {
-    ...env,
-    OPENAI_BASE_URL: joinUrls(resolved.provider.baseURLs),
-    OPENAI_API_KEY: apiKey,
-    ...(responsesPath ? { RESP_RESPONSES_PATH: responsesPath } : null),
-    ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
-  };
+  const env2 = buildOpenAIResponsesUpstreamEnv({
+    env,
+    baseURLs: resolved.provider.baseURLs,
+    apiKey,
+    endpoints: resolved.provider.endpoints,
+    reasoningEffort,
+  });
 
   const stream = Boolean(reqJson.stream);
   const extraSystemText = shouldInjectCopilotToolUseInstructions(request, reqJson) ? copilotToolUseInstructionsText() : "";
@@ -140,7 +154,7 @@ export async function handleOpenAIResponsesRoute({ request, env, gatewayCfg, tok
       requestPreview: previewString(reqLog, 2400),
     });
   }
-  const providerHint = respReq.provider ?? respReq.owned_by ?? respReq.ownedBy ?? respReq.owner ?? respReq.vendor;
+  const providerHint = getProviderHintFromBody(respReq);
   const resolved = resolveModel(gatewayCfg.config, respReq.model, providerHint);
   if (resolved.ok === false) return jsonResponse(resolved.status, resolved.error);
 
@@ -154,25 +168,17 @@ export async function handleOpenAIResponsesRoute({ request, env, gatewayCfg, tok
     if (!apiKey) {
       return jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${resolved.provider.id}`, "server_error"));
     }
-    const responsesPath =
-      (resolved.provider.endpoints &&
-        typeof (resolved.provider.endpoints as any).responsesPath === "string" &&
-        String((resolved.provider.endpoints as any).responsesPath).trim()) ||
-      (resolved.provider.endpoints &&
-        typeof (resolved.provider.endpoints as any).responses_path === "string" &&
-        String((resolved.provider.endpoints as any).responses_path).trim()) ||
-      "";
 
     const modelOpts = resolved.model?.options || {};
     const reasoningEffort = typeof (modelOpts as any).reasoningEffort === "string" ? String((modelOpts as any).reasoningEffort).trim() : "";
 
-    const env2: Env = {
-      ...env,
-      OPENAI_BASE_URL: joinUrls(resolved.provider.baseURLs),
-      OPENAI_API_KEY: apiKey,
-      ...(responsesPath ? { RESP_RESPONSES_PATH: responsesPath } : null),
-      ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
-    };
+    const env2 = buildOpenAIResponsesUpstreamEnv({
+      env,
+      baseURLs: resolved.provider.baseURLs,
+      apiKey,
+      endpoints: resolved.provider.endpoints,
+      reasoningEffort,
+    });
 
     return await handleOpenAIResponsesUpstream({
       request,
@@ -219,4 +225,3 @@ export async function handleOpenAIResponsesRoute({ request, env, gatewayCfg, tok
   if (!openaiJson || typeof openaiJson !== "object") return openaiResp;
   return jsonResponse(200, openAIChatResponseToResponses(openaiJson, modelId));
 }
-

@@ -94,6 +94,14 @@ export async function readJsonBody(request: Request): Promise<{ ok: true; value:
   }
 }
 
+export function getProviderHintFromBody(body: unknown): string {
+  if (!body || typeof body !== "object") return "";
+  const obj: any = body;
+  const raw = obj.provider ?? obj.owned_by ?? obj.ownedBy ?? obj.owner ?? obj.vendor;
+  if (raw == null) return "";
+  return typeof raw === "string" ? raw.trim() : String(raw).trim();
+}
+
 export function copilotToolUseInstructionsText(): string {
   return [
     "Tool use:",
@@ -110,4 +118,3 @@ export function shouldInjectCopilotToolUseInstructions(request: Request, reqJson
   const tools = Array.isArray(reqJson?.tools) ? reqJson.tools : [];
   return tools.length > 0;
 }
-

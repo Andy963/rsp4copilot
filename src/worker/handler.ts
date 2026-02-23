@@ -16,6 +16,26 @@ function generateReqId(): string {
   }
 }
 
+function extractInboundToken(request: Request, path: string, url: URL): string {
+  const authHeader = request.headers.get("authorization");
+
+  let token = bearerToken(authHeader);
+  if (!token && typeof authHeader === "string") {
+    const maybe = authHeader.trim();
+    if (maybe && !maybe.includes(" ")) token = maybe;
+  }
+
+  const headerCandidates = ["x-api-key", "x-goog-api-key", "anthropic-api-key", "x-anthropic-api-key"];
+  for (const name of headerCandidates) {
+    if (token) break;
+    token = request.headers.get(name);
+  }
+
+  if (!token && path.startsWith("/gemini/")) token = url.searchParams.get("key");
+
+  return normalizeAuthValue(token);
+}
+
 export async function handleWorkerFetch(request: Request, env: Env): Promise<Response> {
   const reqId = generateReqId();
   const debug = isDebugEnabled(env);
@@ -70,24 +90,14 @@ async function handleWorkerRequestNoCors({
     if (!workerAuthKeys.length) {
       return jsonResponse(500, jsonError("Server misconfigured: missing WORKER_AUTH_KEY/WORKER_AUTH_KEYS", "server_error"));
     }
+    const workerAuthKeySet = new Set(workerAuthKeys);
 
-    const authHeader = request.headers.get("authorization");
-    let token = bearerToken(authHeader);
-    if (!token && typeof authHeader === "string") {
-      const maybe = authHeader.trim();
-      if (maybe && !maybe.includes(" ")) token = maybe;
-    }
-    if (!token) token = request.headers.get("x-api-key");
-    if (!token) token = request.headers.get("x-goog-api-key");
-    if (!token) token = request.headers.get("anthropic-api-key");
-    if (!token) token = request.headers.get("x-anthropic-api-key");
-    if (!token && path.startsWith("/gemini/")) token = url.searchParams.get("key");
-    token = normalizeAuthValue(token);
+    const token = extractInboundToken(request, path, url);
 
     if (!token) {
       return jsonResponse(401, jsonError("Missing API key", "unauthorized"), { "www-authenticate": "Bearer" });
     }
-    if (!workerAuthKeys.includes(token)) {
+    if (!workerAuthKeySet.has(token)) {
       return jsonResponse(401, jsonError("Unauthorized", "unauthorized"), { "www-authenticate": "Bearer" });
     }
 
@@ -130,4 +140,3 @@ async function handleWorkerRequestNoCors({
     return jsonResponse(500, jsonError(`Internal Server Error: ${message}`, "server_error"));
   }
 }
-

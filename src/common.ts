@@ -40,6 +40,19 @@ export function joinUrls(urls: unknown): string {
   return list.join(",");
 }
 
+export function readFirstStringField(record: unknown, ...keys: string[]): string {
+  if (!record || typeof record !== "object") return "";
+  const obj: any = record;
+  for (const key of keys) {
+    if (!key) continue;
+    const raw = obj[key];
+    if (typeof raw !== "string") continue;
+    const value = raw.trim();
+    if (value) return value;
+  }
+  return "";
+}
+
 export function parseBoolEnv(value: unknown): boolean {
   const v = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (!v) return false;

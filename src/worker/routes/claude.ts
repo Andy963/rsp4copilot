@@ -1,11 +1,11 @@
 import type { Env } from "../../common";
-import { jsonError, jsonResponse, joinUrls } from "../../common";
+import { jsonError, jsonResponse, joinUrls, readFirstStringField } from "../../common";
 import { claudeMessagesRequestToOpenaiChat, handleClaudeCountTokens, openaiChatResponseToClaudeMessage, openaiStreamToClaudeMessagesSse } from "../../claude_api";
 import { getProviderApiKey } from "../../config";
 import { dispatchOpenAIChatToProvider } from "../../dispatch";
 import { resolveModel } from "../../model_resolver";
 import type { RouteArgs } from "../types";
-import { readJsonBody } from "../utils";
+import { getProviderHintFromBody, readJsonBody } from "../utils";
 
 export async function handleClaudeMessagesRoute({ request, env, gatewayCfg, token, debug, reqId, path, startedAt }: RouteArgs): Promise<Response> {
   if (!gatewayCfg.ok || !gatewayCfg.config) {
@@ -17,7 +17,7 @@ export async function handleClaudeMessagesRoute({ request, env, gatewayCfg, toke
     return jsonResponse(400, jsonError("Invalid JSON body"));
   }
   const claudeReq = parsed.value as any;
-  const providerHint = claudeReq.provider ?? claudeReq.owned_by ?? claudeReq.ownedBy ?? claudeReq.owner ?? claudeReq.vendor;
+  const providerHint = getProviderHintFromBody(claudeReq);
   const resolved = resolveModel(gatewayCfg.config, claudeReq.model, providerHint);
   if (resolved.ok === false) return jsonResponse(resolved.status, resolved.error);
 
@@ -66,7 +66,7 @@ export async function handleClaudeCountTokensRoute({ request, env, gatewayCfg, d
     return jsonResponse(400, jsonError("Invalid JSON body"));
   }
   const reqJson = parsed.value as any;
-  const providerHint = reqJson.provider ?? reqJson.owned_by ?? reqJson.ownedBy ?? reqJson.owner ?? reqJson.vendor;
+  const providerHint = getProviderHintFromBody(reqJson);
   const resolved = resolveModel(gatewayCfg.config, reqJson.model, providerHint);
   if (resolved.ok === false) return jsonResponse(resolved.status, resolved.error);
   reqJson.model = resolved.model.upstreamModel;
@@ -81,10 +81,7 @@ export async function handleClaudeCountTokensRoute({ request, env, gatewayCfg, d
     return jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${resolved.provider.id}`, "server_error"));
   }
 
-  const messagesPath =
-    resolved.provider.endpoints && typeof (resolved.provider.endpoints as any).messagesPath === "string"
-      ? String((resolved.provider.endpoints as any).messagesPath).trim()
-      : "";
+  const messagesPath = readFirstStringField(resolved.provider.endpoints, "messagesPath", "messages_path");
   const env2: Env = {
     ...env,
     CLAUDE_BASE_URL: joinUrls(resolved.provider.baseURLs),
@@ -94,4 +91,3 @@ export async function handleClaudeCountTokensRoute({ request, env, gatewayCfg, d
 
   return await handleClaudeCountTokens({ request, env: env2, reqJson, debug, reqId });
 }
-

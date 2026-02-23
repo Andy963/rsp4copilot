@@ -1,4 +1,4 @@
-import { joinUrls, jsonError, jsonResponse, normalizeAuthValue } from "./common";
+import { joinUrls, jsonError, jsonResponse, normalizeAuthValue, readFirstStringField } from "./common";
 import type { Env } from "./common";
 import type { GatewayConfig, ModelConfig, ProviderConfig } from "./config";
 import { getProviderApiKey } from "./config";
@@ -62,10 +62,7 @@ export async function dispatchOpenAIChatToProvider({
     const quirks = provider.quirks || {};
     const providerOpts = provider?.options || {};
     const modelOpts = model?.options || {};
-    const responsesPath =
-      (provider.endpoints && typeof (provider.endpoints as any).responsesPath === "string" && String((provider.endpoints as any).responsesPath).trim()) ||
-      (provider.endpoints && typeof (provider.endpoints as any).responses_path === "string" && String((provider.endpoints as any).responses_path).trim()) ||
-      "";
+    const responsesPath = readFirstStringField(provider.endpoints, "responsesPath", "responses_path");
 
     const upstreamUrls = joinUrls(provider.baseURLs);
     const noInstructionsUrls = truthy((quirks as any).noInstructions) ? upstreamUrls : "";
@@ -104,10 +101,7 @@ export async function dispatchOpenAIChatToProvider({
   if (providerApiMode === "openai-chat-completions") {
     const providerOpts = provider?.options || {};
     const modelOpts = model?.options || {};
-    const chatCompletionsPath =
-      (provider.endpoints && typeof (provider.endpoints as any).chatCompletionsPath === "string" && String((provider.endpoints as any).chatCompletionsPath).trim()) ||
-      (provider.endpoints && typeof (provider.endpoints as any).chat_completions_path === "string" && String((provider.endpoints as any).chat_completions_path).trim()) ||
-      "";
+    const chatCompletionsPath = readFirstStringField(provider.endpoints, "chatCompletionsPath", "chat_completions_path");
     const maxInstructionsChars = pickNumber((modelOpts as any).maxInstructionsChars, (providerOpts as any).maxInstructionsChars);
 
     const env2 = envWithOverrides(env, {
@@ -135,7 +129,7 @@ export async function dispatchOpenAIChatToProvider({
   if (providerApiMode === "claude") {
     const providerOpts = provider?.options || {};
     const modelOpts = model?.options || {};
-    const messagesPath = provider.endpoints && typeof (provider.endpoints as any).messagesPath === "string" ? String((provider.endpoints as any).messagesPath).trim() : "";
+    const messagesPath = readFirstStringField(provider.endpoints, "messagesPath", "messages_path");
     const claudeMaxTokens = pickNumber((modelOpts as any).maxTokens, (modelOpts as any).maxOutputTokens, (providerOpts as any).maxTokens, (providerOpts as any).maxOutputTokens);
     const env2 = envWithOverrides(env, {
       CLAUDE_BASE_URL: joinUrls(provider.baseURLs),
