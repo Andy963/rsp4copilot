@@ -318,28 +318,28 @@ export async function handleClaudeChatCompletions({
 
               // Accumulate tool call arguments for this tool block
               toolCallArgs[toolIndex] = (toolCallArgs[toolIndex] || "") + event.delta.partial_json;
-                // Send argument delta chunk
-                const chunk = {
-                  id: chatId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: claudeModel,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {
-                        tool_calls: [
-                          {
-                            index: toolIndex,
-                            function: { arguments: event.delta.partial_json },
-                          },
-                        ],
-                      },
-                      finish_reason: null,
+              // Send argument delta chunk
+              const chunk = {
+                id: chatId,
+                object: "chat.completion.chunk",
+                created,
+                model: claudeModel,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: toolIndex,
+                          function: { arguments: event.delta.partial_json },
+                        },
+                      ],
                     },
-                  ],
-                };
-                await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
+                    finish_reason: null,
+                  },
+                ],
+              };
+              await writer.write(encoder.encode(encodeSseData(JSON.stringify(chunk))));
             }
           } else if (event.type === "content_block_stop") {
             const blockIndex = Number.isInteger(event.index) ? event.index : null;

@@ -11,19 +11,25 @@ function collectModels(config: GatewayConfig): Array<{ providerId: string; model
   return out;
 }
 
-function modelIdForList(
-  models: Array<{ providerId: string; modelName: string; ownedBy: string }>,
-  entry: { providerId: string; modelName: string; ownedBy: string },
-): string {
-  const count = models.reduce((n, m) => (m.modelName === entry.modelName ? n + 1 : n), 0);
+function countModelNames(models: Array<{ modelName: string }>): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const m of models) {
+    counts.set(m.modelName, (counts.get(m.modelName) || 0) + 1);
+  }
+  return counts;
+}
+
+function modelIdForList(entry: { providerId: string; modelName: string }, counts: Map<string, number>): string {
+  const count = counts.get(entry.modelName) || 0;
   if (count <= 1) return entry.modelName;
   return `${entry.providerId}.${entry.modelName}`;
 }
 
 export function openaiModelsList(config: GatewayConfig): { object: "list"; data: Array<{ id: string; object: "model"; created: number; owned_by: string }> } {
   const models = collectModels(config);
+  const nameCounts = countModelNames(models);
   const ids = models
-    .map((m) => ({ id: modelIdForList(models, m), owned_by: m.ownedBy }))
+    .map((m) => ({ id: modelIdForList(m, nameCounts), owned_by: m.ownedBy }))
     .sort((a, b) => a.id.localeCompare(b.id));
   return {
     object: "list",
@@ -35,8 +41,9 @@ export function geminiModelsList(config: GatewayConfig): {
   models: Array<{ name: string; displayName: string; supportedGenerationMethods: ["generateContent", "streamGenerateContent"] }>;
 } {
   const models = collectModels(config);
+  const nameCounts = countModelNames(models);
   const ids = models
-    .map((m) => modelIdForList(models, m))
+    .map((m) => modelIdForList(m, nameCounts))
     .sort((a, b) => a.localeCompare(b));
   return {
     models: ids.map((id) => ({
