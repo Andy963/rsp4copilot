@@ -27,6 +27,13 @@ export interface GatewayConfig {
   providers: Record<string, ProviderConfig>;
 }
 
+type ParseGatewayConfigResult =
+  | { ok: true; config: GatewayConfig; source: "env"; error: "" }
+  | { ok: false; config: null; source: "none" | "env"; error: string };
+
+let cachedGatewayConfigRaw = "";
+let cachedGatewayConfigResult: ParseGatewayConfigResult | null = null;
+
 function normalizeStringArrayOrString(value: unknown): string[] {
   if (Array.isArray(value)) return value.map((v) => String(v ?? "").trim()).filter(Boolean);
   const s = typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
@@ -117,30 +124,66 @@ export function parseGatewayConfig(env: Env):
   | { ok: true; config: GatewayConfig; source: "env"; error: "" }
   | { ok: false; config: null; source: "none" | "env"; error: string } {
   const raw = readGatewayConfigRaw(env);
+  if (raw.trim() && cachedGatewayConfigResult && raw === cachedGatewayConfigRaw) {
+    return cachedGatewayConfigResult;
+  }
   if (!raw.trim()) return { ok: false, config: null, source: "none", error: "Missing RSP4COPILOT_CONFIG" };
 
   const parsed = parseJsonc(raw);
-  if (!parsed.ok) return { ok: false, config: null, source: "env", error: `Invalid config: ${parsed.error}` };
+  if (!parsed.ok) {
+    const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Invalid config: ${parsed.error}` };
+    cachedGatewayConfigRaw = raw;
+    cachedGatewayConfigResult = res;
+    return res;
+  }
 
   const root = parsed.value;
-  if (!isPlainObject(root)) return { ok: false, config: null, source: "env", error: "Config must be a JSON object" };
+  if (!isPlainObject(root)) {
+    const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: "Config must be a JSON object" };
+    cachedGatewayConfigRaw = raw;
+    cachedGatewayConfigResult = res;
+    return res;
+  }
 
   const version = Number((root as any).version ?? 1);
-  if (!Number.isFinite(version) || version !== 1) return { ok: false, config: null, source: "env", error: "Unsupported config version" };
+  if (!Number.isFinite(version) || version !== 1) {
+    const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: "Unsupported config version" };
+    cachedGatewayConfigRaw = raw;
+    cachedGatewayConfigResult = res;
+    return res;
+  }
 
   const providersRaw = isPlainObject((root as any).providers) ? ((root as any).providers as Record<string, unknown>) : null;
-  if (!providersRaw) return { ok: false, config: null, source: "env", error: "Missing providers" };
+  if (!providersRaw) {
+    const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: "Missing providers" };
+    cachedGatewayConfigRaw = raw;
+    cachedGatewayConfigResult = res;
+    return res;
+  }
 
   const providers: Record<string, ProviderConfig> = {};
   for (const [idRaw, pr] of Object.entries(providersRaw)) {
     const id = String(idRaw ?? "").trim();
     if (!id) continue;
     if (id.includes(".")) {
-      return { ok: false, config: null, source: "env", error: `Provider id must not contain '.': ${id}` };
+      const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Provider id must not contain '.': ${id}` };
+      cachedGatewayConfigRaw = raw;
+      cachedGatewayConfigResult = res;
+      return res;
     }
     const p = normalizeProviderConfig(id, pr);
-    if (!p.apiMode) return { ok: false, config: null, source: "env", error: `Provider ${id}: missing apiMode` };
-    if (!p.baseURLs.length) return { ok: false, config: null, source: "env", error: `Provider ${id}: missing baseURL` };
+    if (!p.apiMode) {
+      const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Provider ${id}: missing apiMode` };
+      cachedGatewayConfigRaw = raw;
+      cachedGatewayConfigResult = res;
+      return res;
+    }
+    if (!p.baseURLs.length) {
+      const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Provider ${id}: missing baseURL` };
+      cachedGatewayConfigRaw = raw;
+      cachedGatewayConfigResult = res;
+      return res;
+    }
     if (!p.ownedBy) p.ownedBy = inferProviderOwnedBy(p.apiMode, id);
 
     // Normalize base URLs early.
@@ -151,15 +194,26 @@ export function parseGatewayConfig(env: Env):
       try {
         new URL(u);
       } catch {
-        return { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL: ${u0}` };
+        const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL: ${u0}` };
+        cachedGatewayConfigRaw = raw;
+        cachedGatewayConfigResult = res;
+        return res;
       }
       normalizedBaseUrls.push(u);
     }
     p.baseURLs = normalizedBaseUrls;
-    if (!p.baseURLs.length) return { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL` };
+    if (!p.baseURLs.length) {
+      const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL` };
+      cachedGatewayConfigRaw = raw;
+      cachedGatewayConfigResult = res;
+      return res;
+    }
 
     if (!p.apiKey && !p.apiKeyEnv) {
-      return { ok: false, config: null, source: "env", error: `Provider ${id}: missing apiKey or apiKeyEnv` };
+      const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Provider ${id}: missing apiKey or apiKeyEnv` };
+      cachedGatewayConfigRaw = raw;
+      cachedGatewayConfigResult = res;
+      return res;
     }
 
     const modelMap: Record<string, ModelConfig> = {};
@@ -170,15 +224,26 @@ export function parseGatewayConfig(env: Env):
     }
     p.models = modelMap;
     if (!Object.keys(p.models).length) {
-      return { ok: false, config: null, source: "env", error: `Provider ${id}: no models configured` };
+      const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Provider ${id}: no models configured` };
+      cachedGatewayConfigRaw = raw;
+      cachedGatewayConfigResult = res;
+      return res;
     }
 
     providers[id] = p;
   }
 
-  if (!Object.keys(providers).length) return { ok: false, config: null, source: "env", error: "No providers configured" };
+  if (!Object.keys(providers).length) {
+    const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: "No providers configured" };
+    cachedGatewayConfigRaw = raw;
+    cachedGatewayConfigResult = res;
+    return res;
+  }
 
-  return { ok: true, config: { version: 1, providers }, source: "env", error: "" };
+  const res: ParseGatewayConfigResult = { ok: true, config: { version: 1, providers }, source: "env", error: "" };
+  cachedGatewayConfigRaw = raw;
+  cachedGatewayConfigResult = res;
+  return res;
 }
 
 export function getProviderApiKey(env: Env, provider: ProviderConfig): string {
