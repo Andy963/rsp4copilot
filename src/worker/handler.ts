@@ -99,6 +99,64 @@ async function handleWorkerRequestNoCors({
     const path = url.pathname.replace(/\/+$/, "") || "/";
     const startedAt = Date.now();
 
+    if (request.method === "GET" && path === "/") {
+      const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rsp4copilot</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; line-height: 1.5; }
+      .wrap { max-width: 920px; margin: 0 auto; padding: 28px 18px; }
+      .card { border: 1px solid rgba(127,127,127,.35); border-radius: 12px; padding: 18px 16px; }
+      h1 { margin: 0 0 8px; font-size: 22px; }
+      p { margin: 8px 0; opacity: .92; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.95em; }
+      ul { margin: 10px 0 0; padding-left: 18px; }
+      li { margin: 4px 0; }
+      .muted { opacity: .75; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>rsp4copilot</h1>
+        <p>Status: <strong>running</strong></p>
+        <p class="muted">This service requires authentication for API routes.</p>
+
+        <p>Common endpoints:</p>
+        <ul>
+          <li><code>POST /v1/chat/completions</code></li>
+          <li><code>POST /v1/completions</code></li>
+          <li><code>POST /v1/responses</code> (aliases: <code>/responses</code>, <code>/openai/v1/responses</code>)</li>
+          <li><code>POST /claude/v1/messages</code></li>
+          <li><code>POST /claude/v1/messages/count_tokens</code></li>
+          <li><code>POST /gemini/v1beta/models/{model}:generateContent</code></li>
+          <li><code>POST /gemini/v1beta/models/{model}:streamGenerateContent?alt=sse</code></li>
+          <li><code>GET  /health</code></li>
+        </ul>
+
+        <p>Auth:</p>
+        <ul>
+          <li>Send your worker key as <code>Authorization: Bearer &lt;WORKER_AUTH_KEY&gt;</code></li>
+          <li>Then use your upstream provider key in the upstream-specific headers/body as usual</li>
+        </ul>
+      </div>
+    </div>
+  </body>
+</html>`;
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+          "x-rsp4copilot": "1",
+        },
+      });
+    }
+
     if (debug) {
       const authHeader = request.headers.get("authorization") || "";
       const hasBearer = typeof authHeader === "string" && authHeader.toLowerCase().includes("bearer ");
