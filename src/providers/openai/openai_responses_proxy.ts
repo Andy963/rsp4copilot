@@ -169,130 +169,177 @@ export async function handleOpenAIResponsesUpstream({
 
   const resp = sel.resp;
   if (stream) {
+    const ct = (resp.headers.get("content-type") || "").toLowerCase();
+    if (!resp.body) return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
+    if (!ct.includes("text/event-stream")) {
+      const outHeaders = { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" };
+      return new Response(resp.body, { status: resp.status, headers: outHeaders });
+    }
+
     // Pass through SSE, but also cache thought_signature for tool calls (required by some gateways).
-    if (!resp.body || !sessionKey) return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
+    if (!sessionKey) return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
 
     const src = resp.body;
     const decoder = new TextDecoder();
     let buf0 = "";
     const thoughtSigUpdates: any = {};
 
-    const tapped = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        const reader = src.getReader();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) controller.enqueue(value);
+	    const tapped = new ReadableStream<Uint8Array>({
+	      async start(controller) {
+	        const reader = src.getReader();
+	        const encoder = new TextEncoder();
+	        let sawDone = false;
+	        let readError: unknown = null;
+	        try {
+	          while (true) {
+	            const { done, value } = await reader.read();
+	            if (done) break;
+	            if (value) controller.enqueue(value);
 
-            const chunkText = decoder.decode(value, { stream: true });
-            buf0 += chunkText;
-            const lines = buf0.split("\n");
-            buf0 = lines.pop() || "";
-            for (const line of lines) {
-              if (!line.startsWith("data:")) continue;
-              const data = line.slice(5).trim();
-              if (!data || data === "[DONE]") continue;
-              let payload: any;
-              try {
-                payload = JSON.parse(data);
-              } catch {
-                continue;
-              }
-              collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
-            }
-          }
-        } catch (err) {
-          controller.error(err);
-          return;
-        } finally {
-          try {
-            reader.releaseLock();
-          } catch {}
-        }
+	            const chunkText = decoder.decode(value, { stream: true });
+	            buf0 += chunkText;
+	            const lines = buf0.split("\n");
+	            buf0 = lines.pop() || "";
+	            for (const line of lines) {
+	              if (!line.startsWith("data:")) continue;
+	              const data = line.slice(5).trim();
+	              if (!data) continue;
+	              if (data === "[DONE]") {
+	                sawDone = true;
+	                continue;
+	              }
+	              let payload: any;
+	              try {
+	                payload = JSON.parse(data);
+	              } catch {
+	                continue;
+	              }
+	              collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
+	            }
+	          }
+	        } catch (err) {
+	          readError = err;
+	        } finally {
+	          try {
+	            await reader.cancel();
+	          } catch {}
+	          try {
+	            reader.releaseLock();
+	          } catch {}
+	        }
+	        if (readError && debug) {
+	          const message = readError instanceof Error ? readError.message : String(readError ?? "stream read error");
+	          logDebug(debug, reqId, "openai responses upstream stream read failed", { path, upstreamUrl: sel.upstreamUrl, error: message });
+	        }
 
-        // Best-effort parse of any remaining buffered line.
-        try {
-          const tail = buf0;
-          buf0 = "";
-          for (const line of String(tail || "").split("\n")) {
-            if (!line.startsWith("data:")) continue;
-            const data = line.slice(5).trim();
-            if (!data || data === "[DONE]") continue;
-            let payload: any;
-            try {
-              payload = JSON.parse(data);
-            } catch {
-              continue;
+	        // Best-effort parse of any remaining buffered line.
+	        try {
+	          const tail = buf0;
+	          buf0 = "";
+	          for (const line of String(tail || "").split("\n")) {
+	            if (!line.startsWith("data:")) continue;
+	            const data = line.slice(5).trim();
+	            if (!data) continue;
+	            if (data === "[DONE]") {
+	              sawDone = true;
+	              continue;
+	            }
+	            let payload: any;
+	            try {
+	              payload = JSON.parse(data);
+	            } catch {
+	              continue;
             }
             collectThoughtSignatureUpdatesFromResponsesSsePayload(payload, thoughtSigUpdates);
           }
         } catch {}
 
-        try {
-          await setResponsesThoughtSignatureCache(sessionKey, thoughtSigUpdates);
-        } catch {}
-        controller.close();
-      },
-    });
+	        try {
+	          await setResponsesThoughtSignatureCache(sessionKey, thoughtSigUpdates);
+	        } catch {}
+	        if (!sawDone) {
+	          try {
+	            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+	          } catch {}
+	        }
+	        controller.close();
+	      },
+	    });
 
-    return new Response(tapped, { status: resp.status, headers: sseHeaders() });
-  }
+	    return new Response(tapped, { status: resp.status, headers: sseHeaders() });
+	  }
 
-  const ct = (resp.headers.get("content-type") || "").toLowerCase();
-  if (!resp.body || !ct.includes("text/event-stream")) {
-    const text = await resp.text();
-    const outHeaders = { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" };
-    return new Response(text, { status: resp.status, headers: outHeaders });
-  }
+	  const ct = (resp.headers.get("content-type") || "").toLowerCase();
+	  if (!resp.body || !ct.includes("text/event-stream")) {
+	    let text = "";
+	    try {
+	      text = await resp.text();
+	    } catch (err) {
+	      const message = err instanceof Error ? err.message : String(err ?? "read failed");
+	      if (debug) logDebug(debug, reqId, "openai upstream read failed", { path, upstreamUrl: sel.upstreamUrl, status: resp.status, error: message });
+	      return jsonResponse(502, jsonError(`Upstream read failed: ${message}`, "bad_gateway"));
+	    }
+	    const outHeaders = { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" };
+	    return new Response(text, { status: resp.status, headers: outHeaders });
+	  }
 
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
+	  const reader = resp.body.getReader();
+	  const decoder = new TextDecoder();
   let buf = "";
   let raw = "";
-  let responseObj: any = null;
-  let sawDataLine = false;
-  let finished = false;
+	  let responseObj: any = null;
+	  let sawDataLine = false;
+	  let finished = false;
 
-  while (!finished) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const chunkText = decoder.decode(value, { stream: true });
-    raw += chunkText;
-    buf += chunkText;
-    const lines = buf.split("\n");
-    buf = lines.pop() || "";
-    for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-      sawDataLine = true;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") {
-        finished = true;
-        break;
-      }
-      let payload: any;
-      try {
-        payload = JSON.parse(data);
-      } catch {
-        continue;
-      }
-      const evt = payload?.type;
-      if ((evt === "response.completed" || evt === "response.failed") && payload?.response && typeof payload.response === "object") {
-        responseObj = payload.response;
-        finished = true;
-        break;
-      }
-    }
-  }
-  try {
-    await reader.cancel();
-  } catch {}
+	  let readError: unknown = null;
+	  try {
+	    while (!finished) {
+	      const { done, value } = await reader.read();
+	      if (done) break;
+	      const chunkText = decoder.decode(value, { stream: true });
+	      raw += chunkText;
+	      buf += chunkText;
+	      const lines = buf.split("\n");
+	      buf = lines.pop() || "";
+	      for (const line of lines) {
+	        if (!line.startsWith("data:")) continue;
+	        sawDataLine = true;
+	        const data = line.slice(5).trim();
+	        if (data === "[DONE]") {
+	          finished = true;
+	          break;
+	        }
+	        let payload: any;
+	        try {
+	          payload = JSON.parse(data);
+	        } catch {
+	          continue;
+	        }
+	        const evt = payload?.type;
+	        if ((evt === "response.completed" || evt === "response.failed") && payload?.response && typeof payload.response === "object") {
+	          responseObj = payload.response;
+	          finished = true;
+	          break;
+	        }
+	      }
+	    }
+	  } catch (err) {
+	    readError = err;
+	  } finally {
+	    try {
+	      await reader.cancel();
+	    } catch {}
+	  }
+	  if (readError) {
+	    const message = readError instanceof Error ? readError.message : String(readError ?? "stream read error");
+	    if (debug) logDebug(debug, reqId, "openai upstream stream read failed", { path, upstreamUrl: sel.upstreamUrl, error: message, sawDataLine, rawLen: raw.length });
+	    return jsonResponse(502, jsonError(`Upstream stream read failed: ${message}`, "bad_gateway"));
+	  }
 
-  if (!responseObj && (!sawDataLine || raw.trim())) {
-    try {
-      const obj = JSON.parse(raw);
-      if (obj && typeof obj === "object") responseObj = obj?.response && typeof obj.response === "object" ? obj.response : obj;
+	  if (!responseObj && (!sawDataLine || raw.trim())) {
+	    try {
+	      const obj = JSON.parse(raw);
+	      if (obj && typeof obj === "object") responseObj = obj?.response && typeof obj.response === "object" ? obj.response : obj;
     } catch {
       // ignore
     }

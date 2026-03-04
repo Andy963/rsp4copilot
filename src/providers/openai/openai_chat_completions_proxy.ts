@@ -127,7 +127,14 @@ export async function handleOpenAIChatCompletionsUpstream({
     return new Response(readable, { status: resp.status, headers: sseHeaders() });
   }
 
-  const text = await resp.text();
+  let text = "";
+  try {
+    text = await resp.text();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err ?? "read failed");
+    if (debug) logDebug(debug, reqId, "openai upstream read failed", { path, upstreamUrl: sel.upstreamUrl, status: resp.status, error: message });
+    return jsonResponse(502, jsonError(`Upstream read failed: ${message}`, "bad_gateway"));
+  }
   const outHeaders = { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" };
   return new Response(text, { status: resp.status, headers: outHeaders });
 }

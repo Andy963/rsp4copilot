@@ -161,6 +161,7 @@ export async function handleOpenAITextCompletionsViaResponses({
     const decoder = new TextDecoder();
     let finished = false;
     let overflow = false;
+    let readError: unknown = null;
     try {
       while (!finished) {
         const { done, value } = await reader.read();
@@ -188,10 +189,17 @@ export async function handleOpenAITextCompletionsViaResponses({
           }
         }
       }
+    } catch (err) {
+      readError = err;
     } finally {
       try {
         await reader.cancel();
       } catch {}
+    }
+    if (readError) {
+      const message = readError instanceof Error ? readError.message : String(readError ?? "stream read error");
+      if (debug) logDebug(debug, reqId, "openai upstream stream read failed", { path, upstreamUrl: sel.upstreamUrl, error: message, sawDataLine, bufferedBytes });
+      return jsonResponse(502, jsonError(`Upstream stream read failed: ${message}`, "bad_gateway"));
     }
     if (overflow) {
       if (debug) logDebug(debug, reqId, "openai upstream buffered sse overflow", { maxBytes, bufferedBytes, sawDataLine, sawDelta, sawAnyText });

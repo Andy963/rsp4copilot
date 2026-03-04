@@ -350,35 +350,56 @@ export async function handleOpenAIChatCompletionsViaResponses({
 
       return false;
     };
-    while (!finished) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bufferedBytes += value.byteLength;
-      if (maxBytes > 0 && bufferedBytes > maxBytes) {
-        overflow = true;
-        break;
-      }
-      const chunkText = decoder.decode(value, { stream: true });
-      const events = sse.push(chunkText);
-      for (const evt0 of events) {
-        if (handleEventData(evt0.data)) {
-          finished = true;
-          break;
-        }
-      }
-      if (!sawDataLine) raw += chunkText;
-    }
-    if (!finished) {
-      for (const evt0 of sse.finish()) {
-        if (handleEventData(evt0.data)) {
-          finished = true;
-          break;
-        }
-      }
-    }
+    let readError: unknown = null;
     try {
-      await reader.cancel();
-    } catch {}
+      while (!finished) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bufferedBytes += value.byteLength;
+        if (maxBytes > 0 && bufferedBytes > maxBytes) {
+          overflow = true;
+          break;
+        }
+        const chunkText = decoder.decode(value, { stream: true });
+        const events = sse.push(chunkText);
+        for (const evt0 of events) {
+          if (handleEventData(evt0.data)) {
+            finished = true;
+            break;
+          }
+        }
+        if (!sawDataLine) raw += chunkText;
+      }
+      if (!finished) {
+        for (const evt0 of sse.finish()) {
+          if (handleEventData(evt0.data)) {
+            finished = true;
+            break;
+          }
+        }
+      }
+    } catch (err) {
+      readError = err;
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {}
+    }
+    if (readError) {
+      const message = readError instanceof Error ? readError.message : String(readError ?? "stream read error");
+      if (debug) {
+        logDebug(debug, reqId, "openai upstream stream read failed", {
+          upstreamUrl: sel.upstreamUrl,
+          error: message,
+          bufferedBytes,
+          sawDataLine,
+          sawDelta,
+          sawAnyText,
+          sawToolCall,
+        });
+      }
+      return jsonResponse(502, jsonError(`Upstream stream read failed: ${message}`, "bad_gateway"));
+    }
     if (overflow) {
       if (debug) {
         logDebug(debug, reqId, "openai upstream buffered sse overflow", {
