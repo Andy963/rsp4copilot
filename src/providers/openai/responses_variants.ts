@@ -1,5 +1,9 @@
 import { normalizeMessageContent } from "../../common";
 
+export type ResponsesReqVariantsOptions = {
+  rewriteInstructions?: boolean;
+};
+
 function responsesReqToPrompt(responsesReq: any): string {
   const parts: string[] = [];
   if (typeof responsesReq.instructions === "string" && responsesReq.instructions.trim()) {
@@ -16,10 +20,17 @@ function responsesReqToPrompt(responsesReq: any): string {
   return parts.join("\n").trim();
 }
 
-export function responsesReqVariants(responsesReq: any, stream: boolean): any[] {
+export function responsesReqVariants(responsesReq: any, stream: boolean, opts: ResponsesReqVariantsOptions = {}): any[] {
   const variants: any[] = [];
   const base = { ...responsesReq, stream: Boolean(stream) };
   variants.push(base);
+
+  const rewriteInstructions = Boolean(opts && typeof opts === "object" && (opts as any).rewriteInstructions);
+  const isAnchored =
+    (typeof base.previous_response_id === "string" && base.previous_response_id.trim()) ||
+    (typeof base.conversation === "string" && base.conversation.trim()) ||
+    false;
+  const allowInstructionRewrite = rewriteInstructions && !isAnchored;
 
   const maxOutput = base.max_output_tokens;
   const instructions = base.instructions;
@@ -52,7 +63,7 @@ export function responsesReqVariants(responsesReq: any, stream: boolean): any[] 
     variants.push(v);
   }
 
-  if (typeof instructions === "string" && instructions.trim() && Array.isArray(input)) {
+  if (allowInstructionRewrite && typeof instructions === "string" && instructions.trim() && Array.isArray(input)) {
     const v = { ...base };
     delete v.instructions;
     v.input = [{ role: "system", content: [{ type: "input_text", text: instructions }] }, ...input];
@@ -79,7 +90,7 @@ export function responsesReqVariants(responsesReq: any, stream: boolean): any[] 
     const v = { ...base, input: stringInput };
     variants.push(v);
 
-    if (typeof instructions === "string" && instructions.trim()) {
+    if (allowInstructionRewrite && typeof instructions === "string" && instructions.trim()) {
       const v2 = { ...v };
       delete v2.instructions;
       v2.input = [{ role: "system", content: instructions }, ...stringInput];
@@ -88,7 +99,7 @@ export function responsesReqVariants(responsesReq: any, stream: boolean): any[] 
   }
 
   const prompt = responsesReqToPrompt(base);
-  if (prompt && !containsImages && !hasToolItems) {
+  if (allowInstructionRewrite && prompt && !containsImages && !hasToolItems) {
     const v = { ...base };
     delete v.instructions;
     v.input = [{ role: "user", content: [{ type: "input_text", text: prompt }] }];
@@ -193,4 +204,3 @@ export function responsesReqVariants(responsesReq: any, stream: boolean): any[] 
   }
   return deduped;
 }
-

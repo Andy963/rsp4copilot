@@ -86,6 +86,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
   path,
   startedAt,
   extraSystemText,
+  compat,
 }: {
   request: Request;
   upstreamUrls: string[];
@@ -105,6 +106,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
   path: string;
   startedAt: number;
   extraSystemText: string;
+  compat?: { rewriteInstructions?: boolean };
 }): Promise<Response> {
   // /v1/chat/completions
   const messages = reqJson?.messages;
@@ -145,6 +147,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
   if (!input.length) return jsonResponse(400, jsonError("messages must include at least one non-system message"));
 
   const effectiveInstructions = appendInstructions(instructions, extraSystemText);
+  const rewriteInstructions = Boolean(compat && typeof compat === "object" && (compat as any).rewriteInstructions);
   const respTools = openaiToolsToResponsesTools(reqJson.tools);
   const respToolChoice = openaiToolChoiceToResponsesToolChoice(reqJson.tool_choice);
 
@@ -201,7 +204,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
   }
 
   const primaryReq = prevReq || fullReq;
-  const primaryVariants = responsesReqVariants(primaryReq, upstreamStream);
+  const primaryVariants = responsesReqVariants(primaryReq, upstreamStream, { rewriteInstructions });
   if (debug) {
     const reqLog = safeJsonStringifyForLog(primaryReq);
     logDebug(debug, reqId, "openai chat request", {
@@ -226,7 +229,7 @@ export async function handleOpenAIChatCompletionsViaResponses({
   // If the upstream doesn't accept `previous_response_id`, fall back to full history.
   if (!sel.ok && prevReq) {
     if (debug) logDebug(debug, reqId, "openai fallback to full history (previous_response_id rejected)", { status: sel.status });
-    const fallbackVariants = responsesReqVariants(fullReq, upstreamStream);
+    const fallbackVariants = responsesReqVariants(fullReq, upstreamStream, { rewriteInstructions });
     const sel2 = await selectUpstreamResponseAny(upstreamUrls, headers, fallbackVariants, debug, reqId, upstreamSelectOpts);
     // Always prefer the fallback result (even if it also failed), since the original error
     // about `previous_response_id` is misleading when the real issue is upstream compatibility.

@@ -7,6 +7,7 @@ import {
   logDebug,
   maskSecret,
   normalizeAuthValue,
+  parseBoolEnv,
   previewString,
   redactHeadersForLog,
   safeJsonStringifyForLog,
@@ -135,7 +136,10 @@ export async function handleOpenAIResponsesUpstream({
   void path;
   void startedAt;
 
-  const variants0 = responsesReqVariants(bodyBase, upstreamStream);
+  const compatRaw = (env as any)?.RESP_COMPAT_REWRITE_INSTRUCTIONS;
+  const rewriteInstructions =
+    compatRaw === true || compatRaw === 1 || parseBoolEnv(typeof compatRaw === "string" ? compatRaw : "");
+  const variants0 = responsesReqVariants(bodyBase, upstreamStream, { rewriteInstructions });
   const variants: any[] = [];
   if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
     for (const v0 of variants0) {

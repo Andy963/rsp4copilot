@@ -2,12 +2,12 @@ import { joinPathPrefix, normalizeBaseUrl, normalizeMessageContent } from "../..
 
 export function normalizeClaudeModelId(modelId: unknown, env: any): string {
   const raw = typeof modelId === "string" ? modelId.trim() : "";
-  if (!raw) return env?.CLAUDE_DEFAULT_MODEL || "claude-sonnet-4-5-20250929";
+  if (!raw) return env?.CLAUDE_DEFAULT_MODEL || "claude-sonnet-4-6";
 
   const lower = raw.toLowerCase();
   if (lower === "claude" || lower === "claude-default") {
     const dm = typeof env?.CLAUDE_DEFAULT_MODEL === "string" ? env.CLAUDE_DEFAULT_MODEL.trim() : "";
-    return dm || "claude-sonnet-4-5-20250929";
+    return dm || "claude-sonnet-4-6";
   }
 
   const last = raw.includes("/") ? raw.split("/").filter(Boolean).pop() || raw : raw;

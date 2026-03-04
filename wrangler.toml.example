@@ -33,7 +33,8 @@ RSP4COPILOT_CONFIG = '''
       "apiKeyEnv": "GEMINI_API_KEY",
       "models": {
         "gemini-3-flash-preview": { "upstreamModel": "gemini-3-flash-preview" },
-        "gemini-3-pro-preview": { "upstreamModel": "gemini-3-pro-preview" }
+        "gemini-3.1-pro-preview": { "upstreamModel": "gemini-3.1-pro-preview" },
+        "gemini-3.1-flash-lite-preview": { "upstreamModel": "gemini-3.1-flash-lite-preview" }
       }
     },
     "claude": {
@@ -42,8 +43,8 @@ RSP4COPILOT_CONFIG = '''
       "apiKeyEnv": "CLAUDE_API_KEY",
       "models": {
         "claude-haiku-4-5-20251001": { "upstreamModel": "claude-haiku-4-5-20251001" },
-        "claude-sonnet-4-5-20250929": { "upstreamModel": "claude-sonnet-4-5-20250929" },
-        "claude-opus-4-5-20251101": { "upstreamModel": "claude-opus-4-5-20251101" }
+        "claude-sonnet-4-6": { "upstreamModel": "claude-sonnet-4-6" },
+        "claude-opus-4-6": { "upstreamModel": "claude-opus-4-6" }
       }
     }
   }

@@ -1,4 +1,4 @@
-import { getRsp4CopilotLimits, getRsp4CopilotStreamLimits, jsonError, jsonResponse, logDebug, normalizeAuthValue, redactHeadersForLog } from "../../common";
+import { getRsp4CopilotLimits, getRsp4CopilotStreamLimits, jsonError, jsonResponse, logDebug, normalizeAuthValue, parseBoolEnv, redactHeadersForLog } from "../../common";
 import { handleOpenAIChatCompletionsViaResponses } from "./handle_chat_completions";
 import { handleOpenAITextCompletionsViaResponses } from "./handle_text_completions";
 import { getPromptCachingParams, getReasoningEffort } from "./params";
@@ -60,6 +60,9 @@ export async function handleOpenAIRequest({
   const streamLimits = getRsp4CopilotStreamLimits(env);
   const reasoningEffort = getReasoningEffort(reqJson, env);
   const promptCache = getPromptCachingParams(reqJson);
+  const compatRaw = (env as any)?.RESP_COMPAT_REWRITE_INSTRUCTIONS;
+  const rewriteInstructions =
+    compatRaw === true || compatRaw === 1 || parseBoolEnv(typeof compatRaw === "string" ? compatRaw : "");
 
   if (isTextCompletions) {
     return await handleOpenAITextCompletionsViaResponses({
@@ -77,6 +80,7 @@ export async function handleOpenAIRequest({
       debug,
       reqId,
       path,
+      compat: { rewriteInstructions },
     });
   }
 
@@ -99,5 +103,6 @@ export async function handleOpenAIRequest({
     path,
     startedAt,
     extraSystemText,
+    compat: { rewriteInstructions },
   });
 }

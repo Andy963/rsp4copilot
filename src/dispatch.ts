@@ -75,6 +75,7 @@ export async function dispatchOpenAIChatToProvider({
       OPENAI_API_KEY: apiKey,
       ...(responsesPath ? { RESP_RESPONSES_PATH: responsesPath } : null),
       ...(noInstructionsUrls ? { RESP_NO_INSTRUCTIONS_URLS: noInstructionsUrls } : null),
+      ...(noInstructionsUrls ? { RESP_COMPAT_REWRITE_INSTRUCTIONS: "1" } : null),
       ...(noPrevUrls ? { RESP_NO_PREVIOUS_RESPONSE_ID_URLS: noPrevUrls } : null),
       ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
       ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),

@@ -110,7 +110,7 @@ Claude Messages:
 curl -sS http://127.0.0.1:8788/claude/v1/messages \
   -H "Authorization: Bearer REPLACE_ME" \
   -H "Content-Type: application/json" \
-  -d '{"model":"claude-sonnet-4-5-20250929","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}'
 ```
 
 Gemini streaming:

@@ -11,12 +11,12 @@ export function isGeminiModelId(modelId: unknown): boolean {
 
 export function normalizeGeminiModelId(modelId: unknown, env: any): string {
   const raw = typeof modelId === "string" ? modelId.trim() : "";
-  if (!raw) return env?.GEMINI_DEFAULT_MODEL || "gemini-3-pro-preview";
+  if (!raw) return env?.GEMINI_DEFAULT_MODEL || "gemini-3.1-pro-preview";
 
   const lower = raw.toLowerCase();
   if (lower === "gemini" || lower === "gemini-default") {
     const dm = typeof env?.GEMINI_DEFAULT_MODEL === "string" ? env.GEMINI_DEFAULT_MODEL.trim() : "";
-    return dm || "gemini-3-pro-preview";
+    return dm || "gemini-3.1-pro-preview";
   }
 
   // If the model is namespaced (e.g. "google/gemini-2.0-flash"), keep only the last segment.
@@ -26,7 +26,7 @@ export function normalizeGeminiModelId(modelId: unknown, env: any): string {
 
 export function normalizeGeminiModelPath(modelId: unknown): string {
   const raw = typeof modelId === "string" ? modelId.trim() : "";
-  if (!raw) return "models/gemini-3-pro-preview";
+  if (!raw) return "models/gemini-3.1-pro-preview";
 
   // Allow explicit "models/..." or "tunedModels/..."
   if (raw.startsWith("models/") || raw.startsWith("tunedModels/")) return raw;
@@ -48,4 +48,3 @@ export function normalizeGeminiModelIdForUpstream(modelId: unknown): string {
   const last = raw.includes("/") ? raw.split("/").filter(Boolean).pop() || raw : raw;
   return last;
 }
-

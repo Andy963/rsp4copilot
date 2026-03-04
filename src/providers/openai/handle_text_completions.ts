@@ -29,6 +29,7 @@ export async function handleOpenAITextCompletionsViaResponses({
   debug,
   reqId,
   path,
+  compat,
 }: {
   upstreamUrls: string[];
   headers: Record<string, string>;
@@ -44,6 +45,7 @@ export async function handleOpenAITextCompletionsViaResponses({
   debug: boolean;
   reqId: string;
   path: string;
+  compat?: { rewriteInstructions?: boolean };
 }): Promise<Response> {
   const prompt = reqJson.prompt;
   const promptText = Array.isArray(prompt) ? (typeof prompt[0] === "string" ? prompt[0] : "") : typeof prompt === "string" ? prompt : String(prompt ?? "");
@@ -77,7 +79,8 @@ export async function handleOpenAITextCompletionsViaResponses({
     }
   }
 
-  const variants0 = responsesReqVariants(responsesReq, upstreamStream);
+  const rewriteInstructions = Boolean(compat && typeof compat === "object" && (compat as any).rewriteInstructions);
+  const variants0 = responsesReqVariants(responsesReq, upstreamStream, { rewriteInstructions });
   const variants: any[] = [];
   if (Number.isInteger(maxInputChars) && maxInputChars > 0) {
     for (const v0 of variants0) {

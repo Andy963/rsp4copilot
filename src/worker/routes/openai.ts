@@ -9,18 +9,24 @@ import { openAIChatSseToResponsesSse } from "../../protocols/stream";
 import { copilotToolUseInstructionsText, getProviderHintFromBody, readJsonBody, shouldInjectCopilotToolUseInstructions } from "../utils";
 import type { RouteArgs } from "../types";
 
+function truthy(v: unknown): boolean {
+  return v === true || v === 1 || (typeof v === "string" && ["1", "true", "yes", "on"].includes(v.trim().toLowerCase()));
+}
+
 function buildOpenAIResponsesUpstreamEnv({
   env,
   baseURLs,
   apiKey,
   endpoints,
   reasoningEffort,
+  compatRewriteInstructions,
 }: {
   env: Env;
   baseURLs: string[];
   apiKey: string;
   endpoints: Record<string, unknown>;
   reasoningEffort: string;
+  compatRewriteInstructions: boolean;
 }): Env {
   const responsesPath = readFirstStringField(endpoints, "responsesPath", "responses_path");
   return {
@@ -28,6 +34,7 @@ function buildOpenAIResponsesUpstreamEnv({
     OPENAI_BASE_URL: joinUrls(baseURLs),
     OPENAI_API_KEY: apiKey,
     ...(responsesPath ? { RESP_RESPONSES_PATH: responsesPath } : null),
+    ...(compatRewriteInstructions ? { RESP_COMPAT_REWRITE_INSTRUCTIONS: "1" } : null),
     ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
   };
 }
@@ -100,6 +107,7 @@ export async function handleOpenAITextCompletionsRoute({ request, env, gatewayCf
 
   const modelOpts = resolved.model?.options || {};
   const reasoningEffort = typeof (modelOpts as any).reasoningEffort === "string" ? String((modelOpts as any).reasoningEffort).trim() : "";
+  const compatRewriteInstructions = truthy((resolved.provider?.quirks as any)?.noInstructions);
 
   const env2 = buildOpenAIResponsesUpstreamEnv({
     env,
@@ -107,6 +115,7 @@ export async function handleOpenAITextCompletionsRoute({ request, env, gatewayCf
     apiKey,
     endpoints: resolved.provider.endpoints,
     reasoningEffort,
+    compatRewriteInstructions,
   });
 
   const stream = Boolean(reqJson.stream);
@@ -171,6 +180,7 @@ export async function handleOpenAIResponsesRoute({ request, env, gatewayCfg, tok
 
     const modelOpts = resolved.model?.options || {};
     const reasoningEffort = typeof (modelOpts as any).reasoningEffort === "string" ? String((modelOpts as any).reasoningEffort).trim() : "";
+    const compatRewriteInstructions = truthy((resolved.provider?.quirks as any)?.noInstructions);
 
     const env2 = buildOpenAIResponsesUpstreamEnv({
       env,
@@ -178,6 +188,7 @@ export async function handleOpenAIResponsesRoute({ request, env, gatewayCfg, tok
       apiKey,
       endpoints: resolved.provider.endpoints,
       reasoningEffort,
+      compatRewriteInstructions,
     });
 
     return await handleOpenAIResponsesUpstream({
