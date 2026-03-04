@@ -70,6 +70,11 @@
 }
 ```
 
+### provider.quirks（上游兼容开关）
+
+- `noInstructions`：仅对 `apiMode: "openai-responses"` 生效。有些中转/网关不接受 Responses 请求里的 `instructions` 字段；开启后会对非锚定请求（无 `previous_response_id` / `conversation`）额外生成兼容变体：把 `instructions` 改写进 `input`（system item）或压平成 prompt 再尝试。
+- `noPreviousResponseId`：仅对 `apiMode: "openai-responses"` 生效。有些中转/网关不接受 `previous_response_id`；开启后会跳过使用/发送 `previous_response_id`，直接走全量历史。
+
 ### 常用 provider.apiMode
 
 > 字段名兼容：推荐 `apiMode`，也支持 `api_mode` / `type`（旧配置兼容）。
@@ -115,7 +120,7 @@ curl -sS http://127.0.0.1:8788/claude/v1/messages \
 
 Gemini streaming:
 ```bash
-curl -N "http://127.0.0.1:8788/gemini/v1beta/models/gemini-3-flash-preview:streamGenerateContent?alt=sse" \
+curl -N "http://127.0.0.1:8788/gemini/v1beta/models/gemini-3.1-flash-lite-preview:streamGenerateContent?alt=sse" \
   -H "x-goog-api-key: REPLACE_ME" \
   -H "Content-Type: application/json" \
   -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
@@ -150,7 +155,7 @@ Continue 的 OpenAI provider 可能会直接调用 `POST /v1/responses`；本 Wo
 配置要点：
 - `apiBase` 填本 Worker 的对外地址（建议 `https://<your-worker-domain>/v1`）
 - `apiKey` 填 `WORKER_AUTH_KEY`（不是上游 key）
-- `model` 填短模型名（如 `gpt-5.2` / `claude-sonnet-...` / `gemini-...`）
+- `model` 填短模型名（如 `gpt-5.2` / `claude-sonnet-4-6` / `gemini-3.1-pro-preview`）
 
 ## Thinking/思维链（透传）
 
