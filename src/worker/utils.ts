@@ -38,6 +38,13 @@ export function getCorsHeaders(request: Request): Record<string, string> {
     "access-control-allow-headers": allowHeaders,
     "access-control-max-age": "86400",
     vary,
+    // 🛡️ Sentinel: Security Enhancement
+    // Add standard HTTP security headers to enforce secure browser behavior
+    // and prevent attacks like MIME-sniffing, clickjacking, and XSS.
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "x-xss-protection": "1; mode=block",
+    "strict-transport-security": "max-age=31536000; includeSubDomains"
   };
 }
 
