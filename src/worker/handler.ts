@@ -12,7 +12,15 @@ function generateReqId(): string {
   try {
     return crypto.randomUUID();
   } catch {
-    return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    try {
+      const arr = new Uint8Array(4);
+      crypto.getRandomValues(arr);
+      const randStr = Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+      return `req_${Date.now().toString(36)}_${randStr}`;
+    } catch {
+      // Ultimate fallback if crypto is completely unavailable
+      return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    }
   }
 }
 
