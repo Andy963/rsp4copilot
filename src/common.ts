@@ -156,7 +156,19 @@ export function normalizeAuthValue(raw: unknown): string {
   return value;
 }
 
-export function getWorkerAuthKeys(env: Env): string[] {
+let _cachedAuthKeyEnv: unknown;
+let _cachedAuthKeysEnv: unknown;
+let _cachedWorkerAuthKeysArray: string[] = [];
+let _cachedWorkerAuthKeysSet: Set<string> | null = null;
+
+function updateWorkerAuthKeysCache(env: Env) {
+  if (env?.WORKER_AUTH_KEY === _cachedAuthKeyEnv && env?.WORKER_AUTH_KEYS === _cachedAuthKeysEnv && _cachedWorkerAuthKeysSet) {
+    return;
+  }
+
+  _cachedAuthKeyEnv = env?.WORKER_AUTH_KEY;
+  _cachedAuthKeysEnv = env?.WORKER_AUTH_KEYS;
+
   const keys = new Set<string>();
 
   const single = normalizeAuthValue(env?.WORKER_AUTH_KEY);
@@ -168,7 +180,18 @@ export function getWorkerAuthKeys(env: Env): string[] {
     if (k) keys.add(k);
   }
 
-  return Array.from(keys);
+  _cachedWorkerAuthKeysSet = keys;
+  _cachedWorkerAuthKeysArray = Array.from(keys);
+}
+
+export function getWorkerAuthKeys(env: Env): string[] {
+  updateWorkerAuthKeysCache(env);
+  return _cachedWorkerAuthKeysArray;
+}
+
+export function isValidWorkerAuthKey(env: Env, key: string): boolean {
+  updateWorkerAuthKeysCache(env);
+  return _cachedWorkerAuthKeysSet!.has(key);
 }
 
 export function bearerToken(headerValue: unknown): string | null {

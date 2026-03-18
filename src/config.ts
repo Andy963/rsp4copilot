@@ -20,6 +20,7 @@ export interface ProviderConfig {
   endpoints: Record<string, unknown>;
   quirks: Record<string, unknown>;
   models: Record<string, ModelConfig>;
+  _parsedBaseURLs?: Array<{ origin: string; pathname: string }>;
 }
 
 export interface GatewayConfig {
@@ -188,11 +189,13 @@ export function parseGatewayConfig(env: Env):
 
     // Normalize base URLs early.
     const normalizedBaseUrls: string[] = [];
+    const parsedBaseURLs: Array<{ origin: string; pathname: string }> = [];
     for (const u0 of p.baseURLs) {
       const u = normalizeBaseUrl(u0).trim();
       if (!u) continue;
       try {
-        new URL(u);
+        const parsed = new URL(u);
+        parsedBaseURLs.push({ origin: parsed.origin, pathname: parsed.pathname || "/" });
       } catch {
         const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL: ${u0}` };
         cachedGatewayConfigRaw = raw;
@@ -202,6 +205,7 @@ export function parseGatewayConfig(env: Env):
       normalizedBaseUrls.push(u);
     }
     p.baseURLs = normalizedBaseUrls;
+    p._parsedBaseURLs = parsedBaseURLs;
     if (!p.baseURLs.length) {
       const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Provider ${id}: invalid baseURL` };
       cachedGatewayConfigRaw = raw;

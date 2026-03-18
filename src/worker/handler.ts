@@ -1,5 +1,5 @@
 import type { Env } from "../common";
-import { bearerToken, getWorkerAuthKeys, isDebugEnabled, jsonError, jsonResponse, logDebug, normalizeAuthValue, previewString } from "../common";
+import { bearerToken, getWorkerAuthKeys, isValidWorkerAuthKey, isDebugEnabled, jsonError, jsonResponse, logDebug, normalizeAuthValue, previewString } from "../common";
 import { parseGatewayConfig } from "../config";
 import { handleClaudeCountTokensRoute, handleClaudeMessagesRoute } from "./routes/claude";
 import { handleGeminiGenerateContentRoute } from "./routes/gemini";
@@ -16,6 +16,8 @@ function generateReqId(): string {
   }
 }
 
+const INBOUND_TOKEN_HEADER_CANDIDATES = ["x-api-key", "x-goog-api-key", "anthropic-api-key", "x-anthropic-api-key"];
+
 function extractInboundToken(request: Request, path: string, url: URL): string {
   const authHeader = request.headers.get("authorization");
 
@@ -25,8 +27,7 @@ function extractInboundToken(request: Request, path: string, url: URL): string {
     if (maybe && !maybe.includes(" ")) token = maybe;
   }
 
-  const headerCandidates = ["x-api-key", "x-goog-api-key", "anthropic-api-key", "x-anthropic-api-key"];
-  for (const name of headerCandidates) {
+  for (const name of INBOUND_TOKEN_HEADER_CANDIDATES) {
     if (token) break;
     token = request.headers.get(name);
   }
@@ -48,21 +49,30 @@ function isPathPrefix(prefix: string, path: string): boolean {
   return full === pfx || full.startsWith(`${pfx}/`);
 }
 
-function findSelfForwardingProviders(gatewayCfg: { providers: Record<string, { baseURLs: string[] }> }, currentUrl: URL): Array<{ providerId: string; baseURL: string }> {
+function findSelfForwardingProviders(gatewayCfg: { providers: Record<string, { baseURLs: string[]; _parsedBaseURLs?: Array<{ origin: string; pathname: string }> }> }, currentUrl: URL): Array<{ providerId: string; baseURL: string }> {
   const out: Array<{ providerId: string; baseURL: string }> = [];
   const currentOrigin = currentUrl.origin;
   const currentPath = normalizePathForPrefixMatch(currentUrl.pathname);
 
   for (const [providerId, provider] of Object.entries(gatewayCfg.providers || {})) {
-    const baseUrls = Array.isArray(provider?.baseURLs) ? provider.baseURLs : [];
-    for (const baseURL of baseUrls) {
-      try {
-        const u = new URL(baseURL);
-        if (u.origin !== currentOrigin) continue;
-        if (!isPathPrefix(u.pathname || "/", currentPath)) continue;
-        out.push({ providerId, baseURL });
-      } catch {
-        // ignore invalid URLs here; config parsing should have validated already
+    if (provider._parsedBaseURLs) {
+      for (let i = 0; i < provider._parsedBaseURLs.length; i++) {
+        const parsedUrl = provider._parsedBaseURLs[i];
+        if (parsedUrl.origin !== currentOrigin) continue;
+        if (!isPathPrefix(parsedUrl.pathname, currentPath)) continue;
+        out.push({ providerId, baseURL: provider.baseURLs[i] });
+      }
+    } else {
+      const baseUrls = Array.isArray(provider?.baseURLs) ? provider.baseURLs : [];
+      for (const baseURL of baseUrls) {
+        try {
+          const u = new URL(baseURL);
+          if (u.origin !== currentOrigin) continue;
+          if (!isPathPrefix(u.pathname || "/", currentPath)) continue;
+          out.push({ providerId, baseURL });
+        } catch {
+          // ignore invalid URLs here; config parsing should have validated already
+        }
       }
     }
   }
@@ -182,14 +192,13 @@ async function handleWorkerRequestNoCors({
     if (!workerAuthKeys.length) {
       return jsonResponse(500, jsonError("Server misconfigured: missing WORKER_AUTH_KEY/WORKER_AUTH_KEYS", "server_error"));
     }
-    const workerAuthKeySet = new Set(workerAuthKeys);
 
     const token = extractInboundToken(request, path, url);
 
     if (!token) {
       return jsonResponse(401, jsonError("Missing API key", "unauthorized"), { "www-authenticate": "Bearer" });
     }
-    if (!workerAuthKeySet.has(token)) {
+    if (!isValidWorkerAuthKey(env, token)) {
       return jsonResponse(401, jsonError("Unauthorized", "unauthorized"), { "www-authenticate": "Bearer" });
     }
 
