@@ -115,21 +115,26 @@ function normalizeModelConfig(name: string, raw: unknown): ModelConfig {
 }
 
 function readGatewayConfigRaw(env: Env): string {
-  const primary = typeof (env as any)?.RSP4COPILOT_CONFIG === "string" ? String((env as any).RSP4COPILOT_CONFIG) : "";
-  if (primary.trim()) return primary;
-  return "";
+  return typeof (env as any)?.RSP4COPILOT_CONFIG === "string" ? String((env as any).RSP4COPILOT_CONFIG) : "";
 }
 
 export function parseGatewayConfig(env: Env):
   | { ok: true; config: GatewayConfig; source: "env"; error: "" }
   | { ok: false; config: null; source: "none" | "env"; error: string } {
   const raw = readGatewayConfigRaw(env);
-  if (raw.trim() && cachedGatewayConfigResult && raw === cachedGatewayConfigRaw) {
+  if (cachedGatewayConfigResult && raw === cachedGatewayConfigRaw) {
     return cachedGatewayConfigResult;
   }
-  if (!raw.trim()) return { ok: false, config: null, source: "none", error: "Missing RSP4COPILOT_CONFIG" };
 
-  const parsed = parseJsonc(raw);
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    const res: ParseGatewayConfigResult = { ok: false, config: null, source: "none", error: "Missing RSP4COPILOT_CONFIG" };
+    cachedGatewayConfigRaw = raw;
+    cachedGatewayConfigResult = res;
+    return res;
+  }
+
+  const parsed = parseJsonc(trimmed);
   if (!parsed.ok) {
     const res: ParseGatewayConfigResult = { ok: false, config: null, source: "env", error: `Invalid config: ${parsed.error}` };
     cachedGatewayConfigRaw = raw;

@@ -156,19 +156,31 @@ export function normalizeAuthValue(raw: unknown): string {
   return value;
 }
 
+let cachedWorkerAuthKeyStr = "";
+let cachedWorkerAuthKeys: string[] = [];
+
 export function getWorkerAuthKeys(env: Env): string[] {
+  const singleRaw = typeof env?.WORKER_AUTH_KEY === "string" ? env.WORKER_AUTH_KEY : "";
+  const multiRaw = typeof env?.WORKER_AUTH_KEYS === "string" ? env.WORKER_AUTH_KEYS : "";
+  const cacheKey = `${singleRaw}\n${multiRaw}`;
+
+  if (cachedWorkerAuthKeys.length > 0 && cacheKey === cachedWorkerAuthKeyStr) {
+    return cachedWorkerAuthKeys;
+  }
+
   const keys = new Set<string>();
 
-  const single = normalizeAuthValue(env?.WORKER_AUTH_KEY);
+  const single = normalizeAuthValue(singleRaw);
   if (single) keys.add(single);
 
-  const multiRaw = typeof env?.WORKER_AUTH_KEYS === "string" ? env.WORKER_AUTH_KEYS : "";
   for (const part of String(multiRaw || "").split(",")) {
     const k = normalizeAuthValue(part);
     if (k) keys.add(k);
   }
 
-  return Array.from(keys);
+  cachedWorkerAuthKeyStr = cacheKey;
+  cachedWorkerAuthKeys = Array.from(keys);
+  return cachedWorkerAuthKeys;
 }
 
 export function bearerToken(headerValue: unknown): string | null {
