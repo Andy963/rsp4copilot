@@ -120,8 +120,8 @@ async function handleWorkerRequestNoCors({
     </style>
   </head>
   <body>
-    <div class="wrap">
-      <div class="card">
+    <main class="wrap">
+      <section class="card">
         <h1>rsp4copilot</h1>
         <p>Status: <strong>running</strong></p>
         <p class="muted">This service requires authentication for API routes.</p>
@@ -143,8 +143,8 @@ async function handleWorkerRequestNoCors({
           <li>Send your worker key as <code>Authorization: Bearer &lt;WORKER_AUTH_KEY&gt;</code></li>
           <li>Then use your upstream provider key in the upstream-specific headers/body as usual</li>
         </ul>
-      </div>
-    </div>
+      </section>
+    </main>
   </body>
 </html>`;
       return new Response(html, {
