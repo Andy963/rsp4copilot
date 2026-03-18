@@ -120,7 +120,7 @@ async function handleWorkerRequestNoCors({
     </style>
   </head>
   <body>
-    <div class="wrap">
+    <main class="wrap">
       <div class="card">
         <h1>rsp4copilot</h1>
         <p>Status: <strong>running</strong></p>
@@ -144,7 +144,7 @@ async function handleWorkerRequestNoCors({
           <li>Then use your upstream provider key in the upstream-specific headers/body as usual</li>
         </ul>
       </div>
-    </div>
+    </main>
   </body>
 </html>`;
       return new Response(html, {
