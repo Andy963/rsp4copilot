@@ -12,6 +12,11 @@ function generateReqId(): string {
   try {
     return crypto.randomUUID();
   } catch {
+    if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+      const arr = new Uint32Array(1);
+      crypto.getRandomValues(arr);
+      return `req_${Date.now().toString(36)}_${arr[0].toString(36)}`;
+    }
     return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
   }
 }
